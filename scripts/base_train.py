@@ -48,6 +48,7 @@ parser.add_argument("--target_flops", type=float, default=-1.0, help="calculate 
 parser.add_argument("--target_param_data_ratio", type=int, default=8, help="calculate num_iterations to maintain data:param ratio (Chinchilla=20, -1 = disable)")
 # Optimization
 parser.add_argument("--device_batch_size", type=int, default=32, help="per-device batch size")
+parser.add_argument("--gqa_ratio", type=int, default=1, help="GQA ratio (num_heads / num_kv_heads)")
 parser.add_argument("--total_batch_size", type=int, default=524288, help="total batch size in tokens")
 parser.add_argument("--embedding_lr", type=float, default=0.3, help="learning rate for embedding parameters (Adam)")
 parser.add_argument("--unembedding_lr", type=float, default=0.004, help="learning rate for unembedding parameters (Adam)")
@@ -68,6 +69,14 @@ parser.add_argument("--sample_every", type=int, default=2000, help="sample from 
 parser.add_argument("--save_every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
 # Output
 parser.add_argument("--model_tag", type=str, default=None, help="override model tag for checkpoint directory name")
+# HyperConnections
+parser.add_argument("--hc_num_streams", type=int, default=1, help="number of hyper-connection streams")
+parser.add_argument("--hc_num_fracs", type=int, default=1, help="number of fractions for hyper-connections")
+parser.add_argument("--hc_disable", action="store_true", help="disable hyper-connections (use identity)")
+parser.add_argument("--mhc", action="store_true", help="enable manifold-constrained hyper-connections")
+parser.add_argument("--sinkhorn_iters", type=int, default=10, help="sinkhorn iterations")
+parser.add_argument("--sinkhorn_tau", type=float, default=0.05, help="sinkhorn tau")
+parser.add_argument("--mhc_h_res_proj", type=str, default="sinkhorn", help="mhc projection method")
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------
@@ -102,7 +111,10 @@ def find_num_heads(model_dim, target_head_dim):
                 return candidate
     return 1
 num_heads = find_num_heads(model_dim, args.head_dim)
-num_kv_heads = num_heads # default is 1:1 GQA (Group Query Attention) ratio (i.e. GQA is disabled)
+# Auto-select num_kv_heads closest to satisfying the gqa_ratio
+target_kv_heads = max(1, num_heads / args.gqa_ratio)
+divisors = [i for i in range(1, num_heads + 1) if num_heads % i == 0]
+num_kv_heads = min(divisors, key=lambda x: abs(x - target_kv_heads))
 print0(f"num_layers: {num_layers}")
 print0(f"model_dim: {model_dim}")
 print0(f"num_heads: {num_heads}")
@@ -133,7 +145,21 @@ if batch_ratio != 1.0:
 # Initialize the Model
 
 # Create a new model with random weights
-model_config_kwargs = dict(sequence_len=args.max_seq_len, vocab_size=vocab_size, n_layer=num_layers, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim)
+model_config_kwargs = dict(
+    sequence_len=args.max_seq_len,
+    vocab_size=vocab_size,
+    n_layer=num_layers,
+    n_head=num_heads,
+    n_kv_head=num_kv_heads,
+    n_embd=model_dim,
+    hc_num_streams=args.hc_num_streams,
+    hc_num_fracs=args.hc_num_fracs,
+    hc_disable=args.hc_disable,
+    mhc=args.mhc,
+    sinkhorn_iters=args.sinkhorn_iters,
+    sinkhorn_tau=args.sinkhorn_tau,
+    mhc_h_res_proj=args.mhc_h_res_proj,
+)
 with torch.device("meta"):
     # All tensors are created as meta tensors (they have shape/dtype but no data)
     model_config = GPTConfig(**model_config_kwargs)

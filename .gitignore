@@ -12,3 +12,8 @@ eval_bundle/
 .claude
 CLAUDE.md
 wandb/
+
+# Logs and checkpoints
+*.log
+
+.vscode/

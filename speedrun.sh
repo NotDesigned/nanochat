@@ -76,14 +76,22 @@ echo "Waiting for dataset download to complete..."
 wait $DATASET_DOWNLOAD_PID
 
 # Number of processes/GPUs to use
-NPROC_PER_NODE=8
+NPROC_PER_NODE=1
 
 # pretrain the d20 model
-torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- --depth=20 --target_param_data_ratio=20 --run=$WANDB_RUN
+# torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- --depth=20 --target_param_data_ratio=20 --run=$WANDB_RUN
+# torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- --depth=8 --target_param_data_ratio=1 --run=$WANDB_RUN \
+#     --device_batch_size=2 --eval_tokens=16384 --max_seq_len=1024 --total_batch_size=262144 --num_iterations=-1 \
+#     --mhc --hc_num_streams=4 --gqa_ratio=4
+torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- --depth=12 --target_param_data_ratio=20 --run=$WANDB_RUN \
+    --device_batch_size=4 --eval_tokens=16384 --max_seq_len=1024 --total_batch_size=262144 --num_iterations=-1 \
+    --mhc --hc_num_streams=4 \
+    --core_metric_every -1 \
+    # --core_metric_max_per_task 50
 # evaluate the model on a larger chunk of train/val data and draw some samples
-torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_loss
+torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_loss -- --device_batch_size=4
 # evaluate the model on CORE tasks
-torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_eval
+torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_eval -- --max-per-task=100
 
 # -----------------------------------------------------------------------------
 # Midtraining (teach the model conversation special tokens, tool use, multiple choice)

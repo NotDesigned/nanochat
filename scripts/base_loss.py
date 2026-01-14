@@ -18,7 +18,7 @@ from nanochat.engine import Engine
 
 # CLI arguments
 parser = argparse.ArgumentParser(description="Evaluate loss on train/val splits and sample from model")
-parser.add_argument("--device_batch_size", type=int, default=32, help="per-device batch size")
+parser.add_argument("--device_batch_size", type=int, default=4, help="per-device batch size (default 4 for single GPU, increase for multi-GPU)")
 parser.add_argument("--split_tokens", type=int, default=20*524288, help="number of tokens to evaluate per split")
 parser.add_argument("--model_tag", type=str, default=None, help="model tag for checkpoint directory")
 parser.add_argument("--model_step", type=int, default=None, help="model step to load")

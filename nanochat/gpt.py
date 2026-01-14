@@ -19,6 +19,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from hyper_connections import get_init_and_expand_reduce_stream_functions
 from nanochat.common import get_dist_info, print0
 from nanochat.muon import Muon, DistMuon
 from nanochat.adamw import DistAdamW
@@ -31,6 +32,18 @@ class GPTConfig:
     n_head: int = 6 # number of query heads
     n_kv_head: int = 6 # number of key/value heads (GQA)
     n_embd: int = 768
+
+    # hyper-connections
+    hc_num_streams: int = 1
+    hc_num_fracs: int = 1
+    hc_disable: bool = False
+    mhc: bool = False
+    sinkhorn_iters: int = 10
+    sinkhorn_tau: float = 0.05
+    mhc_h_res_proj: str = "sinkhorn"
+    ns_steps: int = 5
+    ns_eps: float = 1e-7
+    ns_coeffs: tuple = (3.0, -3.2, 1.2)
 
 
 def norm(x):
@@ -120,15 +133,57 @@ class MLP(nn.Module):
         return x
 
 
+class AttnBranch(nn.Module):
+    def __init__(self, attn):
+        super().__init__()
+        self.attn = attn
+
+    def forward(self, x, cos_sin, kv_cache=None):
+        return self.attn(norm(x), cos_sin, kv_cache)
+
+
+class MlpBranch(nn.Module):
+    def __init__(self, mlp):
+        super().__init__()
+        self.mlp = mlp
+
+    def forward(self, x):
+        return self.mlp(norm(x))
+
+
 class Block(nn.Module):
-    def __init__(self, config, layer_idx):
+    def __init__(self, config, layer_idx, init_hc):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
+        hc_kwargs = dict(
+            mhc=config.mhc,
+            sinkhorn_iters=config.sinkhorn_iters,
+            sinkhorn_tau=config.sinkhorn_tau,
+            mhc_h_res_proj=config.mhc_h_res_proj,
+            ns_steps=config.ns_steps,
+            ns_eps=config.ns_eps,
+            ns_coeffs=config.ns_coeffs,
+        )
+
+        self.hc_attn = init_hc(
+            dim=config.n_embd,
+            branch=AttnBranch(self.attn),
+            layer_index=layer_idx * 2,
+            **hc_kwargs,
+        )
+
+        self.hc_mlp = init_hc(
+            dim=config.n_embd,
+            branch=MlpBranch(self.mlp),
+            layer_index=layer_idx * 2 + 1,
+            **hc_kwargs,
+        )
+
     def forward(self, x, cos_sin, kv_cache):
-        x = x + self.attn(norm(x), cos_sin, kv_cache)
-        x = x + self.mlp(norm(x))
+        x = self.hc_attn(x, cos_sin, kv_cache)
+        x = self.hc_mlp(x)
         return x
 
 
@@ -141,9 +196,20 @@ class GPT(nn.Module):
         padded_vocab_size = ((config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to) * pad_vocab_size_to
         if padded_vocab_size != config.vocab_size:
             print0(f"Padding vocab_size from {config.vocab_size} to {padded_vocab_size} to be divisible by {pad_vocab_size_to}")
+
+        init_hc, expand_stream, reduce_stream = (
+            get_init_and_expand_reduce_stream_functions(
+                config.hc_num_streams,
+                num_fracs=config.hc_num_fracs,
+                disable=config.hc_disable,
+            )
+        )
+        self.expand_stream = expand_stream
+        self.reduce_stream = reduce_stream
+
         self.transformer = nn.ModuleDict({
             "wte": nn.Embedding(padded_vocab_size, config.n_embd),
-            "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
+            "h": nn.ModuleList([Block(config, layer_idx, init_hc) for layer_idx in range(config.n_layer)]),
         })
         self.lm_head = nn.Linear(config.n_embd, padded_vocab_size, bias=False)
         # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
@@ -247,11 +313,42 @@ class GPT(nn.Module):
     def setup_optimizers(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, adam_betas=(0.8, 0.95)):
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
+        
         # Separate out all parameters into 3 groups (matrix, embedding, lm_head)
-        matrix_params = list(self.transformer.h.parameters())
-        embedding_params = list(self.transformer.wte.parameters())
+        matrix_params = []
+        embedding_params = [] # naming this 'embedding_params' but it's really 'adamw_params' (excludes lm_head which has own LR)
         lm_head_params = list(self.lm_head.parameters())
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params)
+        
+        # embedding layer
+        embedding_params.extend(list(self.transformer.wte.parameters()))
+        
+        # transformer blocks
+        for block in self.transformer.h:
+            for name, param in block.named_parameters():
+                # heuristics to distinguish between the "main" weights (Muon) and everything else (AdamW)
+                # The main weights are in the attention and findings (c_q, c_k, c_v, c_proj, c_fc)
+                # We identify them by the fact that they are in the 'branch' submodules
+                # print0(f"DEBUG: param name: {name}")
+
+                # If mhc is enabled, we need to skip parameters that are unused in the forward pass.
+                # These are the standard HyperConnections parameters (alphas, betas, etc)
+                if self.config.mhc:
+                    is_hc_unused = any(k in name for k in [
+                        "static_alpha", "dynamic_alpha_fn", "dynamic_alpha_scale",
+                        "static_beta", "dynamic_beta_fn", "dynamic_beta_scale",
+                        "norm.gamma"  # The internal RMSNorm of HyperConnections is skipped in MHC mode
+                    ])
+                    if is_hc_unused:
+                        param.requires_grad = False
+                        continue
+
+                if "branch.attn" in name or "branch.mlp" in name or "attn.c_" in name or "mlp.c_" in name:
+                    matrix_params.append(param)
+                else:
+                    # this includes HyperConnections parameters (alphas, betas, etc)
+                    embedding_params.append(param)
+        
+        # assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params)
         # Create the AdamW optimizer for the embedding and lm_head
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (having tuned the LRs for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -288,8 +385,10 @@ class GPT(nn.Module):
         # Forward the trunk of the Transformer
         x = self.transformer.wte(idx)
         x = norm(x)
+        x = self.expand_stream(x)
         for block in self.transformer.h:
             x = block(x, cos_sin, kv_cache)
+        x = self.reduce_stream(x)
         x = norm(x)
 
         # Forward the lm_head (compute logits)

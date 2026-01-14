@@ -156,6 +156,9 @@ def main():
     # distributed / precision setup
     device_type = autodetect_device_type()
     ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
+    # For single GPU (world_size=1), use smaller max_per_task to avoid OOM
+    if args.max_per_task < 0:
+        args.max_per_task = 50 if ddp_world_size == 1 else 500
     autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16) if device_type == "cuda" else nullcontext()
 
     # Load model and tokenizer from command line or from file system
