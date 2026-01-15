@@ -87,7 +87,8 @@ torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- 
     --core-metric-every -1 \
     --core-metric-max-per-task 50 \
     --gqa-ratio=4 --save-every=100 \
-     --resume-from-step=200
+    --resume-from-step=300 \
+    --log-every=10
 # evaluate the model on a larger chunk of train/val data and draw some samples
 torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_loss -- --device-batch-size=4
 # evaluate the model on CORE tasks
