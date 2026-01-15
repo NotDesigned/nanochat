@@ -1,30 +1,3 @@
-#!/bin/bash
-
-# This script is the "Best ChatGPT clone that $100 can buy",
-# It is designed to run in ~4 hours on 8XH100 node at $3/GPU/hour.
-
-# 1) Example launch (simplest):
-# bash speedrun.sh
-# 2) Example launch in a screen session (because the run takes ~4 hours):
-# screen -L -Logfile speedrun.log -S speedrun bash speedrun.sh
-# 3) Example launch with wandb logging, but see below for setting up wandb first:
-# WANDB_RUN=speedrun screen -L -Logfile speedrun.log -S speedrun bash speedrun.sh
-
-# Default intermediate artifacts directory is in ~/.cache/nanochat
-export OMP_NUM_THREADS=1
-export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
-mkdir -p $NANOCHAT_BASE_DIR
-
-# -----------------------------------------------------------------------------
-# Python venv setup with uv
-
-# install uv (if not already installed)
-command -v uv &> /dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
-# create a .venv local virtual environment (if it doesn't exist)
-[ -d ".venv" ] || uv venv
-# install the repo dependencies
-uv sync --extra gpu
-# activate venv so that `python` uses the project's venv instead of system python
 source .venv/bin/activate
 
 # -----------------------------------------------------------------------------
@@ -38,56 +11,17 @@ if [ -z "$WANDB_RUN" ]; then
     # by default use "dummy" : it's handled as a special case, skips logging to wandb
     WANDB_RUN=dummy
 fi
-
-# -----------------------------------------------------------------------------
-# During the course of the run, we will be writing markdown reports to the report/
-# directory in the base dir. This command clears it out and writes a header section
-# with a bunch of system info and a timestamp that marks the start of the run.
 python -m nanochat.report reset
 
-# -----------------------------------------------------------------------------
-# Tokenizer
-
-# Download the first ~2B characters of pretraining dataset
-# look at dev/repackage_data_reference.py for details on how this data was prepared
-# each data shard is ~250M chars
-# so we download 2e9 / 250e6 = 8 data shards at this point
-# each shard is ~100MB of text (compressed), so this is about ~800MB of data on disk
-python -m nanochat.dataset -n 8
-# Immediately also kick off downloading more shards in the background while tokenizer trains
-# See comment below for why 370 is the right number here
-python -m nanochat.dataset -n 370 &
-DATASET_DOWNLOAD_PID=$!
-# train the tokenizer with vocab size 2**16 = 65536 on ~2B characters of data
-python -m scripts.tok_train --max-chars=2000000000 --vocab-size=65536
-# evaluate the tokenizer (report compression ratio etc.)
-python -m scripts.tok_eval
-
-# -----------------------------------------------------------------------------
-# Base model (pretraining)
-
-# The d20 model is 561M parameters.
-# Chinchilla says #tokens = 20X #params, so we need 561e6 * 20 = 11.2B tokens.
-# Assume our tokenizer is 4.8 chars/token, this is 11.2B * 4.8 ~= 54B chars.
-# At 250M chars/shard, this is 54B / 250M ~= 216 shards needed for pretraining.
-# Round up to 240 for safety. Also, the new DataLoader wastes about 35% of tokens to cropping
-# so 240 / (1 - 0.35) = 370 shards are needed.
-# At ~100MB/shard, this downloads ~37GB of data to disk.
-# (The total number of shards available in the entire dataset is 1822.)
-echo "Waiting for dataset download to complete..."
-wait $DATASET_DOWNLOAD_PID
-
-# Number of processes/GPUs to use
 NPROC_PER_NODE=${NPROC_PER_NODE:-1}
 
 # pretrain the d20 model
 torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- --depth=12 --target-param-data-ratio=10 --run=$WANDB_RUN \
     --device-batch-size=4 --eval-tokens=16384 --max-seq-len=1024 --total-batch-size=262144 --num-iterations=-1 \
     --mhc --hc-num-streams=4 \
-    --core-metric-every -1 \
+    --core-metric-every 100 \
     --core-metric-max-per-task 50 \
-    --gqa-ratio=4 --save-every=100 \
-     --resume-from-step=200
+    --gqa-ratio=4 --resume-from-step 80
 # evaluate the model on a larger chunk of train/val data and draw some samples
 torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_loss -- --device-batch-size=4
 # evaluate the model on CORE tasks

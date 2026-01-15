@@ -49,7 +49,7 @@ parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate 
 parser.add_argument("--target-param-data-ratio", type=int, default=8, help="calculate num_iterations to maintain data:param ratio (Chinchilla=20, -1 = disable)")
 # Optimization
 parser.add_argument("--device-batch-size", type=int, default=32, help="per-device batch size")
-parser.add_argument("--gqa_ratio", type=int, default=1, help="GQA ratio (num_heads / num_kv_heads)")
+parser.add_argument("--gqa-ratio", type=int, default=1, help="GQA ratio (num_heads / num_kv_heads)")
 parser.add_argument("--total-batch-size", type=int, default=524288, help="total batch size in tokens")
 parser.add_argument("--embedding-lr", type=float, default=0.3, help="learning rate for embedding parameters (Adam)")
 parser.add_argument("--unembedding-lr", type=float, default=0.004, help="learning rate for unembedding parameters (Adam)")
@@ -72,13 +72,13 @@ parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 # HyperConnections
-parser.add_argument("--hc_num_streams", type=int, default=1, help="number of hyper-connection streams")
-parser.add_argument("--hc_num_fracs", type=int, default=1, help="number of fractions for hyper-connections")
-parser.add_argument("--hc_disable", action="store_true", help="disable hyper-connections (use identity)")
+parser.add_argument("--hc-num-streams", type=int, default=1, help="number of hyper-connection streams")
+parser.add_argument("--hc-num-fracs", type=int, default=1, help="number of fractions for hyper-connections")
+parser.add_argument("--hc-disable", action="store_true", help="disable hyper-connections (use identity)")
 parser.add_argument("--mhc", action="store_true", help="enable manifold-constrained hyper-connections")
-parser.add_argument("--sinkhorn_iters", type=int, default=10, help="sinkhorn iterations")
-parser.add_argument("--sinkhorn_tau", type=float, default=0.05, help="sinkhorn tau")
-parser.add_argument("--mhc_h_res_proj", type=str, default="sinkhorn", help="mhc projection method")
+parser.add_argument("--sinkhorn-iters", type=int, default=10, help="sinkhorn iterations")
+parser.add_argument("--sinkhorn-tau", type=float, default=0.05, help="sinkhorn tau")
+parser.add_argument("--mhc-h-res-proj", type=str, default="sinkhorn", help="mhc projection method")
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------

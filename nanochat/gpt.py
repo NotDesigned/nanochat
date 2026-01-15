@@ -9,7 +9,7 @@ Notable features:
 - no learnable params in rmsnorm
 - no bias in linear layers
 - Group-Query Attention (GQA) support for more efficient inference
-- Flash Attention 3 integration
+- PyTorch scaled_dot_product_attention (cross-platform: Windows/Linux/Mac, any GPU)
 """
 
 from functools import partial
@@ -24,13 +24,6 @@ from nanochat.common import get_dist_info, print0
 from nanochat.muon import Muon, DistMuon
 from nanochat.adamw import DistAdamW
 
-# Load Flash Attention 3 from HuggingFace Hub (and silence the progress bar)
-import os
-os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
-# Official docs of FA3 label it as "beta" and want you to install FA3 from source, which is a pain.
-# Wishing for official FA3 wheels soon, for now this seems to be a fast way to get them (ty varunneal)
-from kernels import get_kernel
-flash_attn = get_kernel('varunneal/flash-attention-3').flash_attn_interface
 
 @dataclass
 class GPTConfig:
@@ -45,18 +38,6 @@ class GPTConfig:
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "L"
     
-    # hyper-connections
-    hc_num_streams: int = 1
-    hc_num_fracs: int = 1
-    hc_disable: bool = False
-    mhc: bool = False
-    sinkhorn_iters: int = 10
-    sinkhorn_tau: float = 0.05
-    mhc_h_res_proj: str = "sinkhorn"
-    ns_steps: int = 5
-    ns_eps: float = 1e-7
-    ns_coeffs: tuple = (3.0, -3.2, 1.2)
-
     # hyper-connections
     hc_num_streams: int = 1
     hc_num_fracs: int = 1
@@ -102,38 +83,65 @@ class CausalSelfAttention(nn.Module):
         B, T, C = x.size()
 
         # Project the input to get queries, keys, and values
-        # Shape: (B, T, H, D) - FA3's native layout, no transpose needed!
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
         k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
         v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
 
         # Apply Rotary Embeddings to queries and keys to get relative positional encoding
         cos, sin = cos_sin
-        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin) # QK rotary embedding
         q, k = norm(q), norm(k) # QK norm
+        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2) # make head be batch dim, i.e. (B, T, H, D) -> (B, H, T, D)
 
-        # Attention with Flash Attention 3
-        # FA3 handles GQA automatically when n_kv_heads < n_heads
-        # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
-        if kv_cache is None:
-            # Training: causal attention with optional sliding window
-            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        # Apply KV cache: insert current k,v into cache, get the full view so far
+        if kv_cache is not None:
+            k, v = kv_cache.insert_kv(self.layer_idx, k, v)
+        Tq = q.size(2) # number of queries in this forward pass
+        Tk = k.size(2) # number of keys/values in total (in the cache + current forward pass)
+
+        # Group Query Attention (GQA): PyTorch handles this automatically with enable_gqa=True
+        enable_gqa = self.n_head != self.n_kv_head
+        
+        # Build attention mask based on window_size and kv_cache
+        attn_mask = None
+        device = q.device
+        left_window = window_size[0]
+
+        if kv_cache is None or Tq == Tk:
+            # Training mode (no cache) or full sequence: standard causal + sliding window
+            if left_window >= 0:
+                # Optimized vectorized mask generation instead of for-loop
+                q_idx = torch.arange(Tk - Tq, Tk, device=device).unsqueeze(1)
+                k_idx = torch.arange(Tk, device=device).unsqueeze(0)
+                attn_mask = (k_idx <= q_idx) & (k_idx >= q_idx - left_window)
+        elif Tq == 1:
+            # Inference with single query token
+            if left_window >= 0:
+                q_pos = Tk - 1
+                k_idx = torch.arange(Tk, device=device).unsqueeze(0)
+                attn_mask = (k_idx <= q_pos) & (k_idx >= q_pos - left_window)
         else:
-            # Inference: use flash_attn_with_kvcache which handles cache management
-            k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
-            y = flash_attn.flash_attn_with_kvcache(
-                q, k_cache, v_cache,
-                k=k, v=v,
-                cache_seqlens=kv_cache.cache_seqlens,
-                causal=True,
-                window_size=window_size,
-            )
-            # Advance position after last layer processes
-            if self.layer_idx == kv_cache.n_layers - 1:
-                kv_cache.advance(T)
+            # Inference with multiple queries: prefix full attention, current chunk with window
+            prefix_len = Tk - Tq
+            q_idx = torch.arange(prefix_len, Tk, device=device).unsqueeze(1)
+            k_idx = torch.arange(Tk, device=device).unsqueeze(0)
+            
+            # Mask logic: 
+            # 1. Full attention to prefix (k_idx < prefix_len)
+            # 2. Within current chunk: causal + window (prefix_len <= k_idx <= q_idx AND k_idx >= q_idx - left_window)
+            mask_prefix = k_idx < prefix_len
+            if left_window >= 0:
+                mask_chunk = (k_idx >= prefix_len) & (k_idx <= q_idx) & (k_idx >= q_idx - left_window)
+            else:
+                mask_chunk = (k_idx >= prefix_len) & (k_idx <= q_idx)
+            attn_mask = mask_prefix | mask_chunk
 
-        # Re-assemble the heads and project back to residual stream
-        y = y.contiguous().view(B, T, -1)
+        # Apply attention with GQA support
+        # Note: In newer PyTorch, attn_mask can be bool; SDPA handles conversion.
+        y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, enable_gqa=enable_gqa)
+
+        # Re-assemble the heads side by side and project back to residual stream
+        y = y.transpose(1, 2).contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
 
@@ -156,8 +164,8 @@ class AttnBranch(nn.Module):
         super().__init__()
         self.attn = attn
 
-    def forward(self, x, cos_sin, kv_cache=None):
-        return self.attn(norm(x), cos_sin, kv_cache)
+    def forward(self, x, cos_sin, window_size, kv_cache=None):
+        return self.attn(norm(x), cos_sin, window_size, kv_cache)
 
 
 class MlpBranch(nn.Module):
@@ -199,8 +207,8 @@ class Block(nn.Module):
             **hc_kwargs,
         )
 
-    def forward(self, x, cos_sin, kv_cache):
-        x = self.hc_attn(x, cos_sin, kv_cache)
+    def forward(self, x, cos_sin, window_size, kv_cache):
+        x = self.hc_attn(x, cos_sin, window_size, kv_cache)
         x = self.hc_mlp(x)
         return x
 
@@ -238,12 +246,6 @@ class GPT(nn.Module):
             "h": nn.ModuleList([Block(config, layer_idx, init_hc) for layer_idx in range(config.n_layer)]),
         })
         self.lm_head = nn.Linear(config.n_embd, padded_vocab_size, bias=False)
-        # Per-layer learnable scalars (inspired by modded-nanogpt)
-        # resid_lambdas: scales the residual stream at each layer (init 1.0 = neutral)
-        # x0_lambdas: blends initial embedding back in at each layer (init 0.0 = disabled)
-        # Separate parameters so they can have different optimizer treatment
-        self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))   # fake init, real init in init_weights()
-        self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))     # fake init, real init in init_weights()
         # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them by 10X, but assert fail if we ever reach that amount.
@@ -283,11 +285,6 @@ class GPT(nn.Module):
             torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
-
-        # Per-layer scalars
-        with torch.no_grad():
-            self.resid_lambdas.fill_(1.0)   # 1.0 => typical residual connections at init
-            self.x0_lambdas.fill_(0.0)      # 0.0 => skip connection to input is disabled at init
 
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
@@ -360,8 +357,8 @@ class GPT(nn.Module):
         - Chinchilla counts exp/sum/divide in attention softmax as flops (a little sus and very tiny => we ignore)
         """
         nparams = sum(p.numel() for p in self.parameters())
-        # Exclude non-matmul params: embeddings and per-layer scalars
-        nparams_exclude = self.transformer.wte.weight.numel() + self.resid_lambdas.numel() + self.x0_lambdas.numel()
+        # Exclude non-matmul params: embeddings
+        nparams_exclude = self.transformer.wte.weight.numel()
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
         # Sum attention FLOPs per layer, accounting for sliding window
         attn_flops = 0
@@ -388,12 +385,10 @@ class GPT(nn.Module):
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
         
-        # Separate out all parameters into 5 groups (matrix, embedding, lm_head, resid_lambdas, x0_lambdas)
+        # Separate out all parameters into 3 groups (matrix, embedding, lm_head)
         matrix_params = []
         embedding_params = [] # naming this 'embedding_params' but it's really 'adamw_params' (excludes lm_head which has own LR)
         lm_head_params = list(self.lm_head.parameters())
-        resid_params = [self.resid_lambdas]
-        x0_params = [self.x0_lambdas]
         
         # embedding layer
         embedding_params.extend(list(self.transformer.wte.parameters()))
@@ -405,26 +400,13 @@ class GPT(nn.Module):
                 # The main weights are in the attention and findings (c_q, c_k, c_v, c_proj, c_fc)
                 # We identify them by the fact that they are in the 'branch' submodules
                 # print0(f"DEBUG: param name: {name}")
-
-                # If mhc is enabled, we need to skip parameters that are unused in the forward pass.
-                # These are the standard HyperConnections parameters (alphas, betas, etc)
-                if self.config.mhc:
-                    is_hc_unused = any(k in name for k in [
-                        "static_alpha", "dynamic_alpha_fn", "dynamic_alpha_scale",
-                        "static_beta", "dynamic_beta_fn", "dynamic_beta_scale",
-                        "norm.gamma"  # The internal RMSNorm of HyperConnections is skipped in MHC mode
-                    ])
-                    if is_hc_unused:
-                        param.requires_grad = False
-                        continue
-
                 if "branch.attn" in name or "branch.mlp" in name or "attn.c_" in name or "mlp.c_" in name:
                     matrix_params.append(param)
                 else:
                     # this includes HyperConnections parameters (alphas, betas, etc)
                     embedding_params.append(param)
         
-        # assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(resid_params) + len(x0_params)
+        # assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params)
         # Create the AdamW optimizer for the embedding, lm_head, and per-layer scalars
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (having tuned the LRs for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -432,8 +414,6 @@ class GPT(nn.Module):
         adam_groups = [
             dict(params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale),
             dict(params=embedding_params, lr=embedding_lr * dmodel_lr_scale),
-            dict(params=resid_params, lr=scalar_lr * 0.01), # these are a lot more sensitive because they accumulate in the residual stream
-            dict(params=x0_params, lr=scalar_lr),
         ]
         adamw_kwargs = dict(betas=adam_betas, eps=1e-10, weight_decay=0.0) # NOTE: weight decay is hardcoded to 0.0 for AdamW, only used in Muon
         AdamWFactory = DistAdamW if ddp else partial(torch.optim.AdamW, fused=True)
@@ -463,10 +443,8 @@ class GPT(nn.Module):
         # Forward the trunk of the Transformer
         x = self.transformer.wte(idx)
         x = norm(x)
-        x0 = x  # save initial normalized embedding for x0 residual
         x = self.expand_stream(x)
         for i, block in enumerate(self.transformer.h):
-            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             x = block(x, cos_sin, self.window_sizes[i], kv_cache)
         x = self.reduce_stream(x)
         x = norm(x)
