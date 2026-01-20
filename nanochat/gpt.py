@@ -20,6 +20,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from hyper_connections import get_init_and_expand_reduce_stream_functions
+from hyper_connections import geometric_get_init_and_expand_reduce_stream_functions
 from nanochat.common import get_dist_info, print0
 from nanochat.muon import Muon, DistMuon
 from nanochat.adamw import DistAdamW
@@ -43,6 +44,8 @@ class GPTConfig:
     hc_num_fracs: int = 1
     hc_disable: bool = False
     mhc: bool = False
+    hc_geometric: bool = False  # use geometric-induced hyper-connections
+    hc_manifold_dim: int = 4  # manifold dimension for geometric HC
     sinkhorn_iters: int = 10
     sinkhorn_tau: float = 0.05
     mhc_h_res_proj: str = "sinkhorn"
@@ -183,15 +186,22 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-        hc_kwargs = dict(
-            mhc=config.mhc,
-            sinkhorn_iters=config.sinkhorn_iters,
-            sinkhorn_tau=config.sinkhorn_tau,
-            mhc_h_res_proj=config.mhc_h_res_proj,
-            ns_steps=config.ns_steps,
-            ns_eps=config.ns_eps,
-            ns_coeffs=config.ns_coeffs,
-        )
+        if config.hc_geometric:
+            hc_kwargs = dict(
+                manifold_dim=config.hc_manifold_dim,
+                sinkhorn_iters=config.sinkhorn_iters,
+                sinkhorn_tau=config.sinkhorn_tau,
+            )
+        else:
+            hc_kwargs = dict(
+                mhc=config.mhc,
+                sinkhorn_iters=config.sinkhorn_iters,
+                sinkhorn_tau=config.sinkhorn_tau,
+                mhc_h_res_proj=config.mhc_h_res_proj,
+                ns_steps=config.ns_steps,
+                ns_eps=config.ns_eps,
+                ns_coeffs=config.ns_coeffs,
+            )
 
         self.hc_attn = init_hc(
             dim=config.n_embd,
@@ -231,13 +241,23 @@ class GPT(nn.Module):
         if padded_vocab_size != config.vocab_size:
             print0(f"Padding vocab_size from {config.vocab_size} to {padded_vocab_size} for efficiency")
 
-        init_hc, expand_stream, reduce_stream = (
-            get_init_and_expand_reduce_stream_functions(
-                config.hc_num_streams,
-                num_fracs=config.hc_num_fracs,
-                disable=config.hc_disable,
+        if config.hc_geometric:
+            # Use geometric-induced hyper-connections
+            init_hc, expand_stream, reduce_stream = (
+                geometric_get_init_and_expand_reduce_stream_functions(
+                    config.hc_num_streams,
+                    disable=config.hc_disable,
+                )
             )
-        )
+        else:
+            # Use original hyper-connections
+            init_hc, expand_stream, reduce_stream = (
+                get_init_and_expand_reduce_stream_functions(
+                    config.hc_num_streams,
+                    num_fracs=config.hc_num_fracs,
+                    disable=config.hc_disable,
+                )
+            )
         self.expand_stream = expand_stream
         self.reduce_stream = reduce_stream
 

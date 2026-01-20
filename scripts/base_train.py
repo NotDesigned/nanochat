@@ -78,6 +78,8 @@ parser.add_argument("--hc-num-streams", type=int, default=1, help="number of hyp
 parser.add_argument("--hc-num-fracs", type=int, default=1, help="number of fractions for hyper-connections")
 parser.add_argument("--hc-disable", action="store_true", help="disable hyper-connections (use identity)")
 parser.add_argument("--mhc", action="store_true", help="enable manifold-constrained hyper-connections")
+parser.add_argument("--hc-geometric", action="store_true", help="use geometric-induced hyper-connections (dynamic H matrix)")
+parser.add_argument("--hc-manifold-dim", type=int, default=4, help="manifold dimension for geometric hyper-connections")
 parser.add_argument("--sinkhorn-iters", type=int, default=10, help="sinkhorn iterations")
 parser.add_argument("--sinkhorn-tau", type=float, default=0.05, help="sinkhorn tau")
 parser.add_argument("--mhc-h-res-proj", type=str, default="sinkhorn", help="mhc projection method")
@@ -165,6 +167,8 @@ model_config_kwargs = dict(
     hc_num_fracs=args.hc_num_fracs,
     hc_disable=args.hc_disable,
     mhc=args.mhc,
+    hc_geometric=args.hc_geometric,
+    hc_manifold_dim=args.hc_manifold_dim,
     sinkhorn_iters=args.sinkhorn_iters,
     sinkhorn_tau=args.sinkhorn_tau,
     mhc_h_res_proj=args.mhc_h_res_proj,
