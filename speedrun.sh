@@ -81,14 +81,16 @@ wait $DATASET_DOWNLOAD_PID
 NPROC_PER_NODE=${NPROC_PER_NODE:-1}
 
 # pretrain the d20 model
-torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- --depth=12 --target-param-data-ratio=10 --run=$WANDB_RUN \
-    --device-batch-size=4 --eval-tokens=16384 --max-seq-len=1024 --total-batch-size=262144 --num-iterations=-1 \
-    --mhc --hc-num-streams=4 \
-    --core-metric-every -1 \
-    --core-metric-max-per-task 50 \
-    --gqa-ratio=4 --save-every=100 \
-    --resume-from-step=300 \
-    --log-every=10
+torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- --depth=20 --target-param-data-ratio=20 --run=$WANDB_RUN \
+    --mhc --hc-num-streams=8 --device-batch-size=8
+# torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- --depth=20 --target-param-data-ratio=20 --run=$WANDB_RUN \
+#     --device-batch-size=8 --eval-tokens=16384 --max-seq-len=1024 --total-batch-size=262144 --num-iterations=-1 \
+#     --mhc --hc-num-streams=4 \
+#     --core-metric-every -1 \
+#     --core-metric-max-per-task 50 \
+#     --gqa-ratio=1 --save-every=100 \
+#     --resume-from-step=500 \
+#     --log-every=10
 # evaluate the model on a larger chunk of train/val data and draw some samples
 torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_loss -- --device-batch-size=4
 # evaluate the model on CORE tasks
