@@ -53,15 +53,15 @@ python -m nanochat.report reset
 # each data shard is ~250M chars
 # so we download 2e9 / 250e6 = 8 data shards at this point
 # each shard is ~100MB of text (compressed), so this is about ~800MB of data on disk
-# python -m nanochat.dataset -n 8
+python -m nanochat.dataset -n 8
 # Immediately also kick off downloading more shards in the background while tokenizer trains
 # See comment below for why 370 is the right number here
-# python -m nanochat.dataset -n 370 &
+python -m nanochat.dataset -n 370 &
 # DATASET_DOWNLOAD_PID=$!
 # train the tokenizer with vocab size 2**16 = 65536 on ~2B characters of data
-# python -m scripts.tok_train --max-chars=2000000000 --vocab-size=65536
+python -m scripts.tok_train --max-chars=2000000000 --vocab-size=65536
 # evaluate the tokenizer (report compression ratio etc.)
-# python -m scripts.tok_eval
+python -m scripts.tok_eval
 
 # -----------------------------------------------------------------------------
 # Base model (pretraining)
@@ -74,8 +74,8 @@ python -m nanochat.report reset
 # so 240 / (1 - 0.35) = 370 shards are needed.
 # At ~100MB/shard, this downloads ~37GB of data to disk.
 # (The total number of shards available in the entire dataset is 1822.)
-# echo "Waiting for dataset download to complete..."
-# wait $DATASET_DOWNLOAD_PID
+echo "Waiting for dataset download to complete..."
+wait $DATASET_DOWNLOAD_PID
 
 # Number of processes/GPUs to use
 NPROC_PER_NODE=${NPROC_PER_NODE:-1}
