@@ -83,6 +83,7 @@ parser.add_argument("--hc-manifold-dim", type=int, default=4, help="manifold dim
 parser.add_argument("--sinkhorn-iters", type=int, default=10, help="sinkhorn iterations")
 parser.add_argument("--sinkhorn-tau", type=float, default=0.05, help="sinkhorn tau")
 parser.add_argument("--mhc-h-res-proj", type=str, default="sinkhorn", help="mhc projection method")
+parser.add_argument("--hc-gradient-checkpointing", action="store_true", help="enable gradient checkpointing for HyperConnections")
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------
@@ -125,7 +126,7 @@ print0(f"num_layers: {num_layers}")
 print0(f"model_dim: {model_dim}")
 print0(f"num_heads: {num_heads}")
 print0(f"num_kv_heads: {num_kv_heads}")
-
+print0(f"hc_gradient_checkpointing: {args.hc_gradient_checkpointing}")
 # Optimizer / data / training length related hyperparameters
 # figure out the needed gradient accumulation to reach the desired total batch size
 tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len # tokens per iteration for a single rank
@@ -172,6 +173,7 @@ model_config_kwargs = dict(
     sinkhorn_iters=args.sinkhorn_iters,
     sinkhorn_tau=args.sinkhorn_tau,
     mhc_h_res_proj=args.mhc_h_res_proj,
+    gradient_checkpointing=args.hc_gradient_checkpointing,
 )
 with torch.device("meta"):
     # All tensors are created as meta tensors (they have shape/dtype but no data)

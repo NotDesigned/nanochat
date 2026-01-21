@@ -25,6 +25,7 @@ from torch import nn, Tensor
 import torch.nn.functional as F
 from torch.nn import Module
 from torch.utils._pytree import tree_flatten, tree_unflatten
+from torch.utils.checkpoint import checkpoint
 
 from einops import rearrange, einsum
 from einops.layers.torch import Rearrange, Reduce
@@ -100,13 +101,13 @@ def get_expand_reduce_stream_functions(
 
 
 def get_init_and_expand_reduce_stream_functions(
-    num_streams, dim=None, add_stream_embed=False, disable=None
+    num_streams, dim=None, add_stream_embed=False, disable=None, gradient_checkpointing=False
 ):
     disable = default(disable, num_streams == 1)
 
     hyper_conn_klass = GeometricHyperConnections if not disable else Residual
 
-    init_hyper_conn_fn = partial(hyper_conn_klass, num_streams)
+    init_hyper_conn_fn = partial(hyper_conn_klass, num_streams, gradient_checkpointing=gradient_checkpointing)
     expand_reduce_fns = get_expand_reduce_stream_functions(
         num_streams, add_stream_embed=add_stream_embed, dim=dim, disable=disable
     )
@@ -152,6 +153,7 @@ class GeometricHyperConnections(Module):
         residual_transform: Module | None = None,
         add_branch_out_to_residual: bool = True,
         depth_residual_fn: Callable = add,
+        gradient_checkpointing: bool = False,
     ):
         """
         Args:
@@ -176,7 +178,7 @@ class GeometricHyperConnections(Module):
         self.channel_first = channel_first
         self.add_branch_out_to_residual = add_branch_out_to_residual
         self.depth_residual_fn = depth_residual_fn
-        
+        self.gradient_checkpointing = gradient_checkpointing
         init_residual_index = (
             default(layer_index, randrange(num_residual_streams)) % num_residual_streams
         )
@@ -399,8 +401,12 @@ class GeometricHyperConnections(Module):
 
         if not exists(self.branch):
             return branch_input, add_residual_fn
-
-        branch_output = self.branch(branch_input, *branch_args, **branch_kwargs)
+        if self.gradient_checkpointing and self.training:
+            branch_output = checkpoint( 
+                self.branch, branch_input, *branch_args, **branch_kwargs
+            )
+        else:
+            branch_output = self.branch(branch_input, *branch_args, **branch_kwargs)
         return add_residual_fn(branch_output)
 
 

@@ -53,15 +53,15 @@ python -m nanochat.report reset
 # each data shard is ~250M chars
 # so we download 2e9 / 250e6 = 8 data shards at this point
 # each shard is ~100MB of text (compressed), so this is about ~800MB of data on disk
-python -m nanochat.dataset -n 8
+# python -m nanochat.dataset -n 8
 # Immediately also kick off downloading more shards in the background while tokenizer trains
 # See comment below for why 370 is the right number here
-python -m nanochat.dataset -n 370 &
-DATASET_DOWNLOAD_PID=$!
+# python -m nanochat.dataset -n 370 &
+# DATASET_DOWNLOAD_PID=$!
 # train the tokenizer with vocab size 2**16 = 65536 on ~2B characters of data
-python -m scripts.tok_train --max-chars=2000000000 --vocab-size=65536
+# python -m scripts.tok_train --max-chars=2000000000 --vocab-size=65536
 # evaluate the tokenizer (report compression ratio etc.)
-python -m scripts.tok_eval
+# python -m scripts.tok_eval
 
 # -----------------------------------------------------------------------------
 # Base model (pretraining)
@@ -74,8 +74,8 @@ python -m scripts.tok_eval
 # so 240 / (1 - 0.35) = 370 shards are needed.
 # At ~100MB/shard, this downloads ~37GB of data to disk.
 # (The total number of shards available in the entire dataset is 1822.)
-echo "Waiting for dataset download to complete..."
-wait $DATASET_DOWNLOAD_PID
+# echo "Waiting for dataset download to complete..."
+# wait $DATASET_DOWNLOAD_PID
 
 # Number of processes/GPUs to use
 NPROC_PER_NODE=${NPROC_PER_NODE:-1}
@@ -83,17 +83,18 @@ NPROC_PER_NODE=${NPROC_PER_NODE:-1}
 # pretrain the d20 model
 # torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- --depth=20 --target-param-data-ratio=20 --run=$WANDB_RUN \
     # --mhc --hc-num-streams=8 --device-batch-size=8
-torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- --depth=12 --target-param-data-ratio=5 --run=$WANDB_RUN \
-    --device-batch-size=8 --eval-tokens=65536 --max-seq-len=1024 --total-batch-size=131072 --num-iterations=-1 \
-    --mhc --hc-num-streams=1024 \
+torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- --depth=12 --target-param-data-ratio=5\
+    --device-batch-size=2 --eval-tokens=65536 --max-seq-len=1024 --total-batch-size=131072 --num-iterations=-1 \
+    --mhc --hc-num-streams=64 \
+    --hc-gradient-checkpointing \
     --hc-geometric --hc-manifold-dim=8 \
     --eval-every=100 \
     --core-metric-every 500 \
     --core-metric-max-per-task 50 \
     --gqa-ratio=1 --save-every=100 \
     --log-every=10 \
-    --run=geometric_hc_test
-    # --resume-from-step=500 \
+    --run=$WANDB_RUN \
+    "$@"
 # evaluate the model on a larger chunk of train/val data and draw some samples
 torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_loss -- --device-batch-size=4
 # evaluate the model on CORE tasks

@@ -118,13 +118,13 @@ def get_expand_reduce_stream_functions(
 
 
 def get_init_and_expand_reduce_stream_functions(
-    num_streams, num_fracs=1, dim=None, add_stream_embed=False, disable=None
+    num_streams, num_fracs=1, dim=None, add_stream_embed=False, disable=None, gradient_checkpointing=False
 ):
     disable = default(disable, num_streams == 1 and num_fracs == 1)
 
     hyper_conn_klass = HyperConnections if not disable else Residual
 
-    init_hyper_conn_fn = partial(hyper_conn_klass, num_streams, num_fracs=num_fracs)
+    init_hyper_conn_fn = partial(hyper_conn_klass, num_streams, num_fracs=num_fracs, gradient_checkpointing=gradient_checkpointing)
     expand_reduce_fns = get_expand_reduce_stream_functions(
         num_streams, add_stream_embed=add_stream_embed, dim=dim, disable=disable
     )
@@ -234,6 +234,7 @@ class HyperConnections(Module):
         ns_steps=5,
         ns_eps=1e-7,
         ns_coeffs=(3.0, -3.2, 1.2),
+        gradient_checkpointing=False,
     ):
         """
         Appendix J, Algorithm2 in - https://arxiv.org/abs/2409.19606
@@ -336,6 +337,7 @@ class HyperConnections(Module):
         self.ns_steps = ns_steps
         self.ns_eps = ns_eps
         self.ns_coeffs = ns_coeffs
+        self.gradient_checkpointing = gradient_checkpointing
 
         if mhc:
             assert num_fracs == 1, "mhc currently requires num_fracs = 1"
@@ -586,8 +588,14 @@ class HyperConnections(Module):
 
         if not exists(self.branch):
             return branch_input, add_residual_fn
-
-        branch_output = self.branch(branch_input, *branch_args, **branch_kwargs)
+        
+        if self.gradient_checkpointing and self.training:
+            from torch.utils.checkpoint import checkpoint
+            branch_output = checkpoint(
+                self.branch, branch_input, *branch_args, **branch_kwargs
+            )
+        else:
+            branch_output = self.branch(branch_input, *branch_args, **branch_kwargs)
 
         return add_residual_fn(branch_output)
 

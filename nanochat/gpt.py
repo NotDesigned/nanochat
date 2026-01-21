@@ -52,6 +52,7 @@ class GPTConfig:
     ns_steps: int = 5
     ns_eps: float = 1e-7
     ns_coeffs: tuple = (3.0, -3.2, 1.2)
+    gradient_checkpointing: bool = False
 
 
 def norm(x):
