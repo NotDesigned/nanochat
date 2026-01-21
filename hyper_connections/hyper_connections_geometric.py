@@ -147,6 +147,7 @@ class GeometricHyperConnections(Module):
         # Sinkhorn 参数
         sinkhorn_iters: int = 10,
         sinkhorn_tau: float = 0.05,
+        sinkhorn_tolerance: float = 1e-3,  # 提前终止的收敛阈值
         # 其他
         channel_first: bool = False,
         dropout: float = 0.0,
@@ -162,8 +163,9 @@ class GeometricHyperConnections(Module):
             manifold_dim: 流形空间维度 k（投影后的坐标维度）
             sigma_init: RBF 核的初始 sigma 值
             sigma_learnable: sigma 是否作为可学习参数
-            sinkhorn_iters: Sinkhorn 迭代次数
+            sinkhorn_iters: Sinkhorn 最大迭代次数
             sinkhorn_tau: Sinkhorn 温度参数
+            sinkhorn_tolerance: 提前终止的收敛阈值
         """
         super().__init__()
 
@@ -175,6 +177,7 @@ class GeometricHyperConnections(Module):
         self.branch = branch
         self.sinkhorn_iters = sinkhorn_iters
         self.sinkhorn_tau = sinkhorn_tau
+        self.sinkhorn_tolerance = sinkhorn_tolerance
         self.channel_first = channel_first
         self.add_branch_out_to_residual = add_branch_out_to_residual
         self.depth_residual_fn = depth_residual_fn
@@ -257,11 +260,11 @@ class GeometricHyperConnections(Module):
 
     def batched_sinkhorn(self, logits: Tensor) -> Tensor:
         """
-        批量 Sinkhorn 归一化
-        
+        批量 Sinkhorn 归一化（带提前终止优化）
+
         Args:
             logits: (..., s, s) 任意 batch 维度的 logits
-            
+
         Returns:
             (..., s, s) 双随机矩阵
         """
@@ -273,10 +276,17 @@ class GeometricHyperConnections(Module):
         u = torch.zeros(logits.shape[:-1], device=Z.device, dtype=Z.dtype)
         v = torch.zeros(logits.shape[:-1], device=Z.device, dtype=Z.dtype)
 
-        for _ in range(self.sinkhorn_iters):
+        for iter_num in range(self.sinkhorn_iters):
+            u_prev = u
             # Z: (..., s, s), v: (..., s) -> v.unsqueeze(-2): (..., 1, s)
             u = log_marginal - torch.logsumexp(Z + v.unsqueeze(-2), dim=-1)
             v = log_marginal - torch.logsumexp(Z + u.unsqueeze(-1), dim=-2)
+
+            # 提前终止检查：在前几次迭代后检查收敛
+            if iter_num > 3:
+                max_change = (u - u_prev).abs().max()
+                if max_change < self.sinkhorn_tolerance:
+                    break
 
         return torch.exp(Z + u.unsqueeze(-1) + v.unsqueeze(-2)) * s
 
@@ -317,7 +327,13 @@ class GeometricHyperConnections(Module):
         
         # 计算 branch 输入
         # H_pre: (s,) 静态选择向量
-        branch_input = einsum(H_pre, residuals, "s, b T s d -> b T d")
+
+        # 优化：用矩阵乘法替代einsum
+        # 原: branch_input = einsum(H_pre, residuals, "s, b T s d -> b T d")
+        # 相当于对s维度做加权求和: sum(H_pre[i] * residuals[:, :, i, :])
+        # H_pre: (s,), residuals: (b, T, s, d)
+        H_pre_expanded = H_pre.view(1, 1, s, 1)  # (1, 1, s, 1)
+        branch_input = (residuals * H_pre_expanded).sum(dim=2)  # (b, T, d)
 
         # 收集统计信息（用于调试）
         if getattr(self, "collect_stats", False):

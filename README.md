@@ -101,6 +101,329 @@ And a bit more about computing environments that will run nanochat:
 
 nanochat can be run on CPU or on MPS (if you're on Macbook), and will automatically try to detect what device is best to run on. You're not going to get too far without GPUs, but at least you'll be able to run the code paths and maybe train a tiny LLM with some patience. For an example of how to make all the run commands much smaller (feel free to tune!), you can refer to [dev/runcpu.sh](dev/runcpu.sh) file. You'll see that I'm essentially restricting all scripts to train smaller models, to run for shorter number of iterations, etc. This functionality is new, slightly gnarly (touched a lot of code), and was merged in this [CPU|MPS PR](https://github.com/karpathy/nanochat/pull/88) on Oct 21, 2025.
 
+## Parameters Reference
+
+This section documents all configurable parameters across nanochat's training pipeline. Each script has command-line arguments that can be customized to control the training process.
+
+### Environment Variables
+
+These can be set before running `speedrun.sh`:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `NANOCHAT_BASE_DIR` | `$HOME/.cache/nanochat` | Directory for intermediate artifacts and checkpoints |
+| `WANDB_RUN` | `dummy` | Wandb run name for logging (set to anything other than 'dummy' to enable wandb) |
+| `NPROC_PER_NODE` | `1` | Number of GPUs/processes per node for distributed training |
+| `OMP_NUM_THREADS` | `1` | OpenMP thread count |
+
+### Tokenizer Training (`scripts/tok_train.py`)
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--max-chars` | `10000000000` (10B) | Maximum characters to train tokenizer on |
+| `--doc-cap` | `10000` | Maximum characters per document during training |
+| `--vocab-size` | `32768` (2^15) | Vocabulary size for the tokenizer |
+
+**Example:**
+```bash
+python -m scripts.tok_train --max-chars=2000000000 --vocab-size=65536
+```
+
+### Base Model Training (`scripts/base_train.py`)
+
+#### Logging
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--run` | `dummy` | Wandb run name ('dummy' disables wandb logging) |
+
+#### Runtime
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--device-type` | `""` (autodetect) | Device type: cuda, cpu, or mps |
+
+#### Model Architecture
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--depth` | `20` | Number of Transformer layers |
+| `--aspect-ratio` | `64` | Model dimension = depth × aspect_ratio |
+| `--head-dim` | `128` | Target head dimension for attention |
+| `--max-seq-len` | `2048` | Maximum context length |
+| `--window-pattern` | `SSSL` | Sliding window pattern: L=full attention, S=half context |
+| `--gqa-ratio` | `1` | GQA ratio (num_heads / num_kv_heads) |
+
+#### Training Horizon (use one, in order of precedence)
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--num-iterations` | `-1` | Explicit number of optimization steps (-1 = use ratio/flops) |
+| `--target-flops` | `-1.0` | Calculate iterations to reach target FLOPs (-1 = use ratio) |
+| `--target-param-data-ratio` | `8` | Data:param ratio (Chinchilla=20, -1 = use explicit iterations) |
+
+#### Optimization
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--device-batch-size` | `32` | Per-device batch size (reduce if OOM) |
+| `--total-batch-size` | `524288` | Total batch size in tokens across all devices |
+| `--embedding-lr` | `0.3` | Learning rate for embedding parameters (Adam) |
+| `--unembedding-lr` | `0.004` | Learning rate for unembedding/output parameters (Adam) |
+| `--matrix-lr` | `0.02` | Learning rate for matrix parameters (Muon optimizer) |
+| `--scalar-lr` | `0.5` | Learning rate for scalar parameters (resid_lambdas, x0_lambdas) |
+| `--weight-decay` | `0.2` | Weight decay for Muon optimizer |
+| `--adam-beta1` | `0.8` | Adam beta1 for embedding/unembedding |
+| `--adam-beta2` | `0.95` | Adam beta2 for embedding/unembedding |
+| `--warmup-ratio` | `0.0` | Fraction of iterations for LR warmup |
+| `--warmdown-ratio` | `0.4` | Fraction of iterations for LR warmdown |
+| `--final-lr-frac` | `0.0` | Final LR as fraction of initial LR |
+| `--resume-from-step` | `-1` | Resume training from checkpoint step (-1 = start fresh) |
+
+#### Evaluation
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--eval-every` | `250` | Evaluate validation loss every N steps (-1 = disable) |
+| `--eval-tokens` | `10485760` (20×524288) | Number of tokens for validation evaluation |
+| `--core-metric-every` | `2000` | Evaluate CORE metric every N steps (-1 = disable) |
+| `--core-metric-max-per-task` | `500` | Number of examples per task for CORE evaluation |
+| `--sample-every` | `2000` | Sample text from model every N steps (-1 = disable) |
+| `--save-every` | `-1` | Save checkpoints every N steps (-1 = only at end) |
+| `--log-every` | `10` | Log training stats every N steps |
+
+#### Output
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--model-tag` | `None` | Override model tag for checkpoint directory (default: d{depth}) |
+
+#### HyperConnections (Advanced)
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--hc-num-streams` | `1` | Number of hyper-connection streams |
+| `--hc-num-fracs` | `1` | Number of fractions for hyper-connections |
+| `--hc-disable` | `False` | Disable hyper-connections (use identity) |
+| `--mhc` | `False` | Enable manifold-constrained hyper-connections |
+| `--hc-geometric` | `False` | Use geometric-induced hyper-connections |
+| `--hc-manifold-dim` | `4` | Manifold dimension for geometric hyper-connections |
+| `--hc-gradient-checkpointing` | `False` | Enable gradient checkpointing for HyperConnections |
+| `--sinkhorn-iters` | `10` | Sinkhorn iterations for MHC |
+| `--sinkhorn-tau` | `0.05` | Sinkhorn tau parameter |
+| `--mhc-h-res-proj` | `sinkhorn` | MHC projection method |
+
+**Example:**
+```bash
+torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- \
+  --depth=20 \
+  --device-batch-size=32 \
+  --target-param-data-ratio=20 \
+  --run=my_run
+```
+
+### Midtraining (`scripts/mid_train.py`)
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--run` | `dummy` | Wandb run name ('dummy' disables wandb logging) |
+| `--device-type` | `""` (autodetect) | Device type: cuda, cpu, or mps |
+| `--dtype` | `bfloat16` | Precision: float32 or bfloat16 |
+| `--model-tag` | `None` | Model tag to load from base training |
+| `--model-step` | `None` | Specific checkpoint step to load |
+| `--num-iterations` | `-1` | Number of optimization steps (-1 = full epoch) |
+| `--max-seq-len` | `2048` | Maximum context length |
+| `--device-batch-size` | `32` | Per-device batch size |
+| `--total-batch-size` | `524288` | Total batch size in tokens |
+| `--embedding-lr` | `0.2` | Learning rate for embedding parameters |
+| `--unembedding-lr` | `0.004` | Learning rate for unembedding parameters |
+| `--matrix-lr` | `0.02` | Learning rate for matrix parameters |
+| `--weight-decay` | `0.0` | Weight decay for Adam optimizer |
+| `--init-lr-frac` | `1.0` | Initial LR as fraction of base LR |
+| `--eval-every` | `150` | Evaluate validation loss every N steps |
+| `--eval-tokens` | `10485760` | Number of tokens for validation |
+| `--dry-run` | `False` | Log to wandb but skip checkpoints/report |
+
+**Example:**
+```bash
+torchrun --standalone --nproc_per_node=8 -m scripts.mid_train -- \
+  --device-batch-size=16 \
+  --run=my_mid_run
+```
+
+### Supervised Finetuning (`scripts/chat_sft.py`)
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--run` | `dummy` | Wandb run name ('dummy' disables wandb logging) |
+| `--device-type` | `""` (autodetect) | Device type: cuda, cpu, or mps |
+| `--dtype` | `bfloat16` | Precision: float32 or bfloat16 |
+| `--source` | `mid` | Checkpoint source: base or mid |
+| `--model-tag` | `None` | Model tag to load from |
+| `--model-step` | `None` | Specific checkpoint step to load |
+| `--num-epochs` | `1` | Number of training epochs |
+| `--num-iterations` | `-1` | Override number of iterations (-1 = use num_epochs) |
+| `--device-batch-size` | `4` | Per-device batch size |
+| `--target-examples-per-step` | `32` | Target examples per optimization step |
+| `--embedding-lr` | `0.2` | Learning rate for embedding parameters |
+| `--unembedding-lr` | `0.004` | Learning rate for unembedding parameters |
+| `--matrix-lr` | `0.02` | Learning rate for matrix parameters |
+| `--weight-decay` | `0.0` | Weight decay for Adam optimizer |
+| `--init-lr-frac` | `0.02` | Initial LR as fraction of base LR |
+| `--eval-every` | `100` | Evaluate validation loss every N steps |
+| `--eval-steps` | `100` | Number of batches for validation evaluation |
+| `--eval-metrics-every` | `200` | Evaluate accuracy metrics every N steps |
+| `--eval-metrics-max-problems` | `1024` | Max problems per metric evaluation |
+
+**Example:**
+```bash
+torchrun --standalone --nproc_per_node=8 -m scripts.chat_sft -- \
+  --num-epochs=1 \
+  --run=my_sft_run
+```
+
+### Reinforcement Learning (`scripts/chat_rl.py`)
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--run` | `dummy` | Wandb run name ('dummy' disables wandb logging) |
+| `--device-type` | `""` (autodetect) | Device type: cuda, cpu, or mps |
+| `--dtype` | `bfloat16` | Precision: float32 or bfloat16 |
+| `--source` | `sft` | Checkpoint source: mid or sft |
+| `--model-tag` | `None` | Model tag to load from |
+| `--model-step` | `None` | Specific checkpoint step to load |
+| `--num-epochs` | `1` | Number of epochs over GSM8K |
+| `--device-batch-size` | `8` | Max batch size per forward pass |
+| `--examples-per-step` | `16` | Total examples per optimization step |
+| `--num-samples` | `16` | Number of samples per example/question |
+| `--max-new-tokens` | `256` | Max tokens to generate per sample |
+| `--temperature` | `1.0` | Sampling temperature |
+| `--top-k` | `50` | Top-k sampling (0 = disabled) |
+| `--embedding-lr` | `0.2` | Learning rate for embedding parameters |
+| `--unembedding-lr` | `0.004` | Learning rate for unembedding parameters |
+| `--matrix-lr` | `0.02` | Learning rate for matrix parameters |
+| `--weight-decay` | `0.0` | Weight decay for Adam optimizer |
+| `--init-lr-frac` | `0.05` | Initial LR as fraction of base LR |
+| `--eval-every` | `60` | Evaluate pass@k every N steps |
+| `--eval-examples` | `400` | Number of examples for pass@k evaluation |
+| `--save-every` | `60` | Save checkpoint every N steps |
+
+**Example:**
+```bash
+torchrun --standalone --nproc_per_node=8 -m scripts.chat_rl -- \
+  --num-epochs=1 \
+  --run=my_rl_run
+```
+
+### Base Model Evaluation (`scripts/base_eval.py`)
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--hf-path` | `None` | HuggingFace model path to evaluate (e.g., openai-community/gpt2) |
+| `--max-per-task` | `-1` | Max examples per task to evaluate (-1 = all examples) |
+| `--model-tag` | `None` | Model tag for checkpoint directory |
+| `--step` | `None` | Specific checkpoint step to load |
+
+**Example:**
+```bash
+torchrun --standalone --nproc_per_node=8 -m scripts.base_eval -- --max-per-task=100
+```
+
+### Base Model Loss Evaluation (`scripts/base_loss.py`)
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--device-batch-size` | `4` | Per-device batch size (increase for multi-GPU) |
+| `--split-tokens` | `20971520` (40×524288) | Number of tokens to evaluate per split |
+| `--model-tag` | `None` | Model tag for checkpoint directory |
+| `--model-step` | `None` | Specific checkpoint step to load |
+| `--device-type` | `""` (autodetect) | Device type: cuda, cpu, or mps |
+| `--hf-path` | `None` | HuggingFace model path (e.g., openai-community/gpt2) |
+
+**Example:**
+```bash
+torchrun --standalone --nproc_per_node=8 -m scripts.base_loss
+```
+
+### Chat Model Evaluation (`scripts/chat_eval.py`)
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `-i, --source` | Required | Source of the model: sft, mid, or rl |
+| `-a, --task-name` | `None` (all tasks) | Task name to evaluate (use \| to split multiple tasks) |
+| `-d, --dtype` | `bfloat16` | Precision: float32 or bfloat16 |
+| `-t, --temperature` | `0.0` | Sampling temperature |
+| `-m, --max-new-tokens` | `512` | Max tokens to generate |
+| `-n, --num-samples` | `1` | Number of samples per prompt |
+| `-k, --top-k` | `50` | Top-k sampling parameter |
+| `-b, --batch-size` | `8` | Batch size for categorical evaluation |
+| `-g, --model-tag` | `None` | Model tag to load |
+| `-s, --step` | `None` | Specific checkpoint step to load |
+| `-x, --max-problems` | `None` | Max problems to evaluate |
+| `--device-type` | `""` (autodetect) | Device type: cuda, cpu, or mps |
+
+**Example:**
+```bash
+python -m scripts.chat_eval -i sft -a "ARC-Easy|GSM8K"
+```
+
+### Chat CLI (`scripts/chat_cli.py`)
+
+Interactive command-line chat interface.
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `-i, --source` | `sft` | Source of the model: sft, mid, or rl |
+| `-g, --model-tag` | `None` | Model tag to load |
+| `-s, --step` | `None` | Specific checkpoint step to load |
+| `-p, --prompt` | `""` | Prompt the model for single response (leave empty for interactive mode) |
+| `-t, --temperature` | `0.6` | Temperature for generation |
+| `-k, --top-k` | `50` | Top-k sampling parameter |
+| `--device-type` | `""` (autodetect) | Device type: cuda, cpu, or mps |
+| `-d, --dtype` | `bfloat16` | Precision: float32 or bfloat16 |
+
+**Example:**
+```bash
+# Interactive mode
+python -m scripts.chat_cli -i sft
+
+# Single prompt mode
+python -m scripts.chat_cli -i sft -p "Why is the sky blue?"
+```
+
+### Chat Web Server (`scripts/chat_web.py`)
+
+Web-based chat interface with API endpoints.
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `-n, --num-gpus` | `1` | Number of GPUs to use for data parallelism |
+| `-i, --source` | `sft` | Source of the model: sft, mid, or rl |
+| `-t, --temperature` | `0.8` | Default temperature for generation |
+| `-k, --top-k` | `50` | Default top-k sampling parameter |
+| `-m, --max-tokens` | `512` | Default max tokens for generation |
+| `-g, --model-tag` | `None` | Model tag to load |
+| `-s, --step` | `None` | Specific checkpoint step to load |
+| `-p, --port` | `8000` | Port to run the server on |
+| `-d, --dtype` | `bfloat16` | Precision: float32 or bfloat16 |
+| `--device-type` | `""` (autodetect) | Device type: cuda, cpu, or mps |
+| `--host` | `0.0.0.0` | Host to bind the server to |
+
+**Example:**
+```bash
+# Single GPU
+python -m scripts.chat_web
+
+# Multi-GPU (4 GPUs)
+python -m scripts.chat_web --num-gpus 4 --port 8000
+```
+
+**API Endpoints:**
+- `GET /` - Chat UI
+- `POST /chat/completions` - Chat API (streaming only)
+- `GET /health` - Health check with worker pool status
+- `GET /stats` - Worker pool statistics and GPU utilization
+
+### Common Tips
+
+- **Memory Management**: If you encounter OOM errors, reduce `--device-batch-size`. The code automatically adjusts gradient accumulation to maintain the same effective batch size.
+- **Batch Size Scaling**: Learning rates are automatically scaled based on batch size using square root scaling for AdamW and Muon optimizers.
+- **Weight Decay Scaling**: Weight decay is automatically scaled by `(12/depth)^2` to account for model size.
+- **Device Auto-detection**: Leave `--device-type` empty to automatically select the best available device (cuda > mps > cpu).
+- **Checkpointing**: Use `--model-tag` to organize multiple training runs with custom names instead of default `d{depth}` naming.
+
 ## Customization
 
 To customize your nanochat, see [Guide: infusing identity to your nanochat](https://github.com/karpathy/nanochat/discussions/139) in Discussions, which describes how you can tune your nanochat's personality through synthetic data generation and mixing that data into midtraining and SFT stages.
