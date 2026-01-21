@@ -33,6 +33,10 @@ print_banner()
 # -----------------------------------------------------------------------------
 # CLI arguments
 parser = argparse.ArgumentParser(description="Pretrain base model")
+# Geometric Hyper-Connection H matrix control
+parser.add_argument("--hc-h-mode", type=str, default="per-token", choices=["per-token", "per-seq", "chunk"], help="H matrix mode for geometric hyper-connections: per-token, per-seq, chunk")
+parser.add_argument("--hc-chunk-size", type=int, default=8, help="Chunk size for H_mode=chunk in geometric hyper-connections")
+parser.add_argument("--hc-pool-type", type=str, default="mean", choices=["mean", "max"], help="Pooling type for H matrix: mean or max")
 # Logging
 parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
 # Runtime
@@ -83,7 +87,7 @@ parser.add_argument("--hc-manifold-dim", type=int, default=4, help="manifold dim
 parser.add_argument("--sinkhorn-iters", type=int, default=10, help="sinkhorn iterations")
 parser.add_argument("--sinkhorn-tau", type=float, default=0.05, help="sinkhorn tau")
 parser.add_argument("--mhc-h-res-proj", type=str, default="sinkhorn", help="mhc projection method")
-parser.add_argument("--hc-gradient-checkpointing", action="store_true", help="enable gradient checkpointing for HyperConnections")
+parser.add_argument("--gradient-checkpointing", action="store_true", help="enable gradient checkpointing for HyperConnections")
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------
@@ -126,7 +130,7 @@ print0(f"num_layers: {num_layers}")
 print0(f"model_dim: {model_dim}")
 print0(f"num_heads: {num_heads}")
 print0(f"num_kv_heads: {num_kv_heads}")
-print0(f"hc_gradient_checkpointing: {args.hc_gradient_checkpointing}")
+print0(f"gradient_checkpointing: {args.gradient_checkpointing}")
 # Optimizer / data / training length related hyperparameters
 # figure out the needed gradient accumulation to reach the desired total batch size
 tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len # tokens per iteration for a single rank
@@ -173,7 +177,10 @@ model_config_kwargs = dict(
     sinkhorn_iters=args.sinkhorn_iters,
     sinkhorn_tau=args.sinkhorn_tau,
     mhc_h_res_proj=args.mhc_h_res_proj,
-    gradient_checkpointing=args.hc_gradient_checkpointing,
+    gradient_checkpointing=args.gradient_checkpointing,
+    hc_h_mode=args.hc_h_mode,
+    hc_chunk_size=args.hc_chunk_size,
+    hc_pool_type=args.hc_pool_type,
 )
 with torch.device("meta"):
     # All tensors are created as meta tensors (they have shape/dtype but no data)
@@ -297,7 +304,7 @@ while True:
     flops_so_far = num_flops_per_token * args.total_batch_size * step
 
     # once in a while: evaluate the val bpb (all ranks participate)
-    if args.eval_every > 0 and (last_step or step % args.eval_every == 0):
+    if args.eval_every > 0 and (last_step or step % args.eval_every == 0 and step > 0):
         model.eval()
         val_loader = build_val_loader()
         eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)

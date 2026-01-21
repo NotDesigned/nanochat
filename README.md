@@ -200,7 +200,7 @@ python -m scripts.tok_train --max-chars=2000000000 --vocab-size=65536
 | `--mhc` | `False` | Enable manifold-constrained hyper-connections |
 | `--hc-geometric` | `False` | Use geometric-induced hyper-connections |
 | `--hc-manifold-dim` | `4` | Manifold dimension for geometric hyper-connections |
-| `--hc-gradient-checkpointing` | `False` | Enable gradient checkpointing for HyperConnections |
+| `--gradient-checkpointing` | `False` | Enable gradient checkpointing for HyperConnections |
 | `--sinkhorn-iters` | `10` | Sinkhorn iterations for MHC |
 | `--sinkhorn-tau` | `0.05` | Sinkhorn tau parameter |
 | `--mhc-h-res-proj` | `sinkhorn` | MHC projection method |

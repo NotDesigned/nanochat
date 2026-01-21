@@ -47,6 +47,9 @@ class GPTConfig:
     mhc: bool = False
     hc_geometric: bool = False  # use geometric-induced hyper-connections
     hc_manifold_dim: int = 4  # manifold dimension for geometric HC
+    hc_h_mode: str = "per-token"
+    hc_chunk_size: int = 8
+    hc_pool_type: str = "mean"
     sinkhorn_iters: int = 10
     sinkhorn_tau: float = 0.05
     mhc_h_res_proj: str = "sinkhorn"
@@ -252,6 +255,9 @@ class GPT(nn.Module):
                     config.hc_num_streams,
                     disable=config.hc_disable,
                     gradient_checkpointing=config.gradient_checkpointing,
+                    H_mode=config.hc_h_mode,
+                    chunk_size=config.hc_chunk_size,
+                    pool_type=config.hc_pool_type,
                 )
             )
         else:
@@ -470,23 +476,23 @@ class GPT(nn.Module):
         cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
 
         # Forward the trunk of the Transformer
-        x = self.transformer.wte(idx)
-        x = norm(x)
-        x = self.expand_stream(x)
-        for i, block in enumerate(self.transformer.h):
-            if self.config.gradient_checkpointing and self.training:
-                # 细粒度checkpointing：只对MLP做checkpoint，保留attention的activations
-                # 原因：
-                # - Attention计算快且需要KV cache，recompute代价高
-                # - MLP计算慢但内存占用大(4x expansion)，recompute代价相对小
-                # 效果：减少20-30%内存，增加10-15%计算时间（只recompute MLP）
-                x = block.hc_attn(x, cos_sin, self.window_sizes[i], kv_cache)
-                x = checkpoint(block.hc_mlp, x, use_reentrant=False)
-            else:
-                x = block(x, cos_sin, self.window_sizes[i], kv_cache)
-        x = self.reduce_stream(x)
-        x = norm(x)
-
+        x = self.transformer.wte(idx)        
+        # 尝试：对整个transformer应用checkpointing以进一步节省内存
+        def transformer_forward(x, blocks, cos_sin, window_sizes, kv_cache):
+            x = norm(x)
+            x = self.expand_stream(x)
+            for i, block in enumerate(blocks):
+                x = block(x, cos_sin, window_sizes[i], kv_cache) 
+            x = self.reduce_stream(x)
+            x = norm(x)
+            return x
+            
+        if self.config.gradient_checkpointing and self.training and kv_cache is None:
+            # 全局checkpointing：只保存expand前后的x，中间所有流张量都被丢弃
+            x = checkpoint(transformer_forward, x, self.transformer.h, cos_sin, self.window_sizes, kv_cache, use_reentrant=False)
+        else:
+            x = transformer_forward(x, self.transformer.h, cos_sin, self.window_sizes, kv_cache)
+        
         # Forward the lm_head (compute logits)
         softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
         logits = self.lm_head(x) # (B, T, padded_vocab_size) <- very big tensor, large amount of memory
