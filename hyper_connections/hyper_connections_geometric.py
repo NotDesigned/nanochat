@@ -181,7 +181,6 @@ class GeometricHyperConnections(Module):
         self.branch = branch
         self.sinkhorn_iters = sinkhorn_iters
         self.sinkhorn_tau = sinkhorn_tau
-        self.sinkhorn_tolerance = sinkhorn_tolerance
         self.channel_first = channel_first
         self.add_branch_out_to_residual = add_branch_out_to_residual
         self.depth_residual_fn = depth_residual_fn
