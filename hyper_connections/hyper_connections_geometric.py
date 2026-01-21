@@ -332,7 +332,7 @@ class GeometricHyperConnections(Module):
         # 原: branch_input = einsum(H_pre, residuals, "s, b T s d -> b T d")
         # 相当于对s维度做加权求和: sum(H_pre[i] * residuals[:, :, i, :])
         # H_pre: (s,), residuals: (b, T, s, d)
-        H_pre_expanded = H_pre.view(1, 1, s, 1)  # (1, 1, s, 1)
+        H_pre_expanded = H_pre.view(1, 1, -1, 1)  # (1, 1, s, 1)
         branch_input = (residuals * H_pre_expanded).sum(dim=2)  # (b, T, d)
 
         # 收集统计信息（用于调试）
