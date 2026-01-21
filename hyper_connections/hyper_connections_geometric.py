@@ -402,8 +402,8 @@ class GeometricHyperConnections(Module):
         if not exists(self.branch):
             return branch_input, add_residual_fn
         if self.gradient_checkpointing and self.training:
-            branch_output = checkpoint( 
-                self.branch, branch_input, *branch_args, **branch_kwargs
+            branch_output = checkpoint(
+                self.branch, branch_input, *branch_args, **branch_kwargs, use_reentrant=False
             )
         else:
             branch_output = self.branch(branch_input, *branch_args, **branch_kwargs)

@@ -24,6 +24,7 @@ from hyper_connections import geometric_get_init_and_expand_reduce_stream_functi
 from nanochat.common import get_dist_info, print0
 from nanochat.muon import Muon, DistMuon
 from nanochat.adamw import DistAdamW
+from torch.utils.checkpoint import checkpoint
 
 
 @dataclass
@@ -248,6 +249,7 @@ class GPT(nn.Module):
                 geometric_get_init_and_expand_reduce_stream_functions(
                     config.hc_num_streams,
                     disable=config.hc_disable,
+                    gradient_checkpointing=config.gradient_checkpointing,
                 )
             )
         else:
@@ -257,6 +259,7 @@ class GPT(nn.Module):
                     config.hc_num_streams,
                     num_fracs=config.hc_num_fracs,
                     disable=config.hc_disable,
+                    gradient_checkpointing=config.gradient_checkpointing,
                 )
             )
         self.expand_stream = expand_stream
@@ -466,7 +469,11 @@ class GPT(nn.Module):
         x = norm(x)
         x = self.expand_stream(x)
         for i, block in enumerate(self.transformer.h):
-            x = block(x, cos_sin, self.window_sizes[i], kv_cache)
+            if self.config.gradient_checkpointing and self.training:
+                # Use gradient checkpointing to save memory when scaling streams
+                x = checkpoint(block, x, cos_sin, self.window_sizes[i], kv_cache, use_reentrant=False)
+            else:
+                x = block(x, cos_sin, self.window_sizes[i], kv_cache)
         x = self.reduce_stream(x)
         x = norm(x)
 

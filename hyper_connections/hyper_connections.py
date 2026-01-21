@@ -10,6 +10,7 @@ from torch import nn, cat
 import torch.nn.functional as F
 from torch.nn import Module, Sequential
 from torch.utils._pytree import tree_flatten, tree_unflatten
+from torch.utils.checkpoint import checkpoint
 
 from einops import rearrange, repeat, reduce, einsum
 from einops.layers.torch import Rearrange, Reduce
@@ -590,9 +591,8 @@ class HyperConnections(Module):
             return branch_input, add_residual_fn
         
         if self.gradient_checkpointing and self.training:
-            from torch.utils.checkpoint import checkpoint
             branch_output = checkpoint(
-                self.branch, branch_input, *branch_args, **branch_kwargs
+                self.branch, branch_input, *branch_args, **branch_kwargs, use_reentrant=False
             )
         else:
             branch_output = self.branch(branch_input, *branch_args, **branch_kwargs)
