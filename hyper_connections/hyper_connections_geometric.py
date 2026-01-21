@@ -315,17 +315,10 @@ class GeometricHyperConnections(Module):
         u = torch.zeros(logits.shape[:-1], device=Z.device, dtype=Z.dtype)
         v = torch.zeros(logits.shape[:-1], device=Z.device, dtype=Z.dtype)
 
-        for iter_num in range(self.sinkhorn_iters):
-            u_prev = u
+        for _ in range(self.sinkhorn_iters):
             # Z: (..., s, s), v: (..., s) -> v.unsqueeze(-2): (..., 1, s)
             u = log_marginal - torch.logsumexp(Z + v.unsqueeze(-2), dim=-1)
             v = log_marginal - torch.logsumexp(Z + u.unsqueeze(-1), dim=-2)
-
-            # 提前终止检查：在前几次迭代后检查收敛
-            if iter_num > 3:
-                max_change = (u - u_prev).abs().max()
-                if max_change < self.sinkhorn_tolerance:
-                    break
 
         return torch.exp(Z + u.unsqueeze(-1) + v.unsqueeze(-2)) * s
 
