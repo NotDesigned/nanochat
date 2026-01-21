@@ -287,27 +287,31 @@ class GeometricHyperConnections(Module):
         # 处理 channel first
         if self.channel_first:
             residuals = rearrange(residuals, "b d ... -> b ... d")
+            maybe_transformed_residuals = rearrange(maybe_transformed_residuals, "b d ... -> b ... d")
 
         # 分离出各个流
         # residuals: (b*s, T, d) -> (b, T, s, d)
         residuals = rearrange(residuals, "(b s) T d -> b T s d", s=streams)
+        # 同样处理transformed版本，用于后续混合
+        residuals_mixed_source = rearrange(maybe_transformed_residuals, "(b s) T d -> b T s d", s=streams)
 
         # 计算几何诱导的 H_res 矩阵（位置相关）
         # H_res: (b, T, s, s)
         H_res, coords = self.compute_geometric_H(residuals)
-        
+
         # H_pre: 选择 branch 输入
         H_pre = F.softmax(self.H_pre_logits, dim=-1)
-        
+
         # H_post: 分配 branch 输出
         H_post = None
         if self.add_branch_out_to_residual:
             H_post = F.softmax(self.H_post_logits, dim=-1)
 
         # 应用 H_res 混合残差流（位置相关）
-        # residuals: (b, T, s, d), H_res: (b, T, s, t)
+        # 使用transformed版本进行混合，以保证residual_transform生效
+        # residuals_mixed_source: (b, T, s, d), H_res: (b, T, s, t)
         # 对每个位置独立进行流混合
-        residuals_mixed = einsum(H_res, residuals, "b T s t, b T s d -> b T t d")
+        residuals_mixed = einsum(H_res, residuals_mixed_source, "b T s t, b T s d -> b T t d")
         
         # 计算 branch 输入
         # H_pre: (s,) 静态选择向量

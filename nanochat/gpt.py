@@ -116,25 +116,25 @@ class CausalSelfAttention(nn.Module):
                 # Optimized vectorized mask generation instead of for-loop
                 q_idx = torch.arange(Tk - Tq, Tk, device=device).unsqueeze(1)
                 k_idx = torch.arange(Tk, device=device).unsqueeze(0)
-                attn_mask = (k_idx <= q_idx) & (k_idx >= q_idx - left_window)
+                attn_mask = (k_idx <= q_idx) & (k_idx > q_idx - left_window)
         elif Tq == 1:
             # Inference with single query token
             if left_window >= 0:
                 q_pos = Tk - 1
                 k_idx = torch.arange(Tk, device=device).unsqueeze(0)
-                attn_mask = (k_idx <= q_pos) & (k_idx >= q_pos - left_window)
+                attn_mask = (k_idx <= q_pos) & (k_idx > q_pos - left_window)
         else:
             # Inference with multiple queries: prefix full attention, current chunk with window
             prefix_len = Tk - Tq
             q_idx = torch.arange(prefix_len, Tk, device=device).unsqueeze(1)
             k_idx = torch.arange(Tk, device=device).unsqueeze(0)
             
-            # Mask logic: 
+            # Mask logic:
             # 1. Full attention to prefix (k_idx < prefix_len)
-            # 2. Within current chunk: causal + window (prefix_len <= k_idx <= q_idx AND k_idx >= q_idx - left_window)
+            # 2. Within current chunk: causal + window (prefix_len <= k_idx <= q_idx AND k_idx > q_idx - left_window)
             mask_prefix = k_idx < prefix_len
             if left_window >= 0:
-                mask_chunk = (k_idx >= prefix_len) & (k_idx <= q_idx) & (k_idx >= q_idx - left_window)
+                mask_chunk = (k_idx >= prefix_len) & (k_idx <= q_idx) & (k_idx > q_idx - left_window)
             else:
                 mask_chunk = (k_idx >= prefix_len) & (k_idx <= q_idx)
             attn_mask = mask_prefix | mask_chunk
