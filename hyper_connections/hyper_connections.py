@@ -15,6 +15,8 @@ from torch.utils.checkpoint import checkpoint
 from einops import rearrange, repeat, reduce, einsum
 from einops.layers.torch import Rearrange, Reduce
 
+from nanochat.common import print0
+
 """
 ein notation:
 b - batch
@@ -173,8 +175,10 @@ def get_init_and_expand_reduce_stream_functions(
     - Standard: Original learnable alpha/beta (when mhc=False, hc_geometric=False)
     - MHC: manifold-constraint Hyper-Connections with static/dynamic/Geometry H (when mhc=True)
     """
-    disable = default(disable, num_streams == 1)
-
+    if num_streams == 1:
+        print0("Warning: num_streams=1, HyperConnections will be disabled.")
+        disable = True
+    
     hyper_conn_klass = HyperConnections if not disable else Residual
 
     init_hyper_conn_fn = partial(
