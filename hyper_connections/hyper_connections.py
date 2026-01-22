@@ -451,10 +451,11 @@ class HyperConnections(Module):
                 "orthostochastic",
             ), "mhc_h_res_proj must be 'sinkhorn' or 'orthostochastic'"
 
-            # 静态 H 参数（作为 beta，即 bias）
-            H_res_init = torch.full((num_residual_streams, num_residual_streams), -8.0)
-            H_res_init.fill_diagonal_(0.0)
-            self.H_res_beta = nn.Parameter(H_res_init)
+            if not hc_geometric:
+                # 静态 H 参数（作为 beta，即 bias）
+                H_res_init = torch.full((num_residual_streams, num_residual_streams), -8.0)
+                H_res_init.fill_diagonal_(0.0)
+                self.H_res_beta = nn.Parameter(H_res_init)
 
             H_pre_init = torch.full((num_residual_streams,), -8.0)
             H_pre_init[init_residual_index] = 0.0
@@ -557,7 +558,7 @@ class HyperConnections(Module):
             coords_seq = self.proj_head(normed).squeeze(1)  # (b, s, k)
             dist_sq = torch.cdist(coords_seq, coords_seq, p=2) ** 2
             H_res_logits = -dist_sq / (2 * self.sigma ** 2)
-            H_res = sinkhorn_log(H_res_logits, self.sinkhorn_iters, self.sinkhorn_tau)
+            H_res = sinkhorn_log(H_res_logits, self.sinkhorn_iters, self.sinkhorn_tau) # (b, s, s)
         else:
             raise ValueError(f"Unknown H_mode: {self.H_mode}")
 
@@ -696,9 +697,14 @@ class HyperConnections(Module):
                 residuals_mixed = einsum(
                     H_res, residuals_mixed_source, "b ... s t, b ... s d -> b ... t d"
                 )
-                branch_input = einsum(
-                    H_pre, residuals, "b ... s, b ... s d -> b ... d"
-                )
+                if self.hc_geometric: # geometric H_pre is static
+                    branch_input = einsum(
+                        H_pre, residuals, "s, b ... s d -> b ... d"
+                    )
+                else:
+                    branch_input = einsum(
+                        H_pre, residuals, "b ... s, b ... s d -> b ... d"
+                    )
                 
 
             if self.channel_first:
