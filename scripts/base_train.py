@@ -34,9 +34,9 @@ print_banner()
 # CLI arguments
 parser = argparse.ArgumentParser(description="Pretrain base model")
 # Geometric Hyper-Connection H matrix control
-parser.add_argument("--hc-h-mode", type=str, default="per-token", choices=["per-token", "per-seq", "chunk"], help="H matrix mode for geometric hyper-connections: per-token, per-seq, chunk")
-parser.add_argument("--hc-chunk-size", type=int, default=8, help="Chunk size for H_mode=chunk in geometric hyper-connections")
-parser.add_argument("--hc-pool-type", type=str, default="mean", choices=["mean", "max"], help="Pooling type for H matrix: mean or max")
+parser.add_argument("--hc-h-mode", type=str, default="per-token", choices=["per-token", "per-seq"], help="H matrix mode for geometric hyper-connections: per-token, per-seq")
+# parser.add_argument("--hc-chunk-size", type=int, default=8, help="Chunk size for H_mode=chunk in geometric hyper-connections")
+parser.add_argument("--hc-pool-type", type=str, default="mean", choices=["mean", "max", "last"], help="Pooling type for H matrix: mean, max, or last")
 # Logging
 parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
 # Runtime
@@ -79,10 +79,11 @@ parser.add_argument("--log-every", type=int, default=10, help="log training stat
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 # HyperConnections
 parser.add_argument("--hc-num-streams", type=int, default=1, help="number of hyper-connection streams")
-parser.add_argument("--hc-num-fracs", type=int, default=1, help="number of fractions for hyper-connections")
+# parser.add_argument("--hc-num-fracs", type=int, default=1, help="number of fractions for hyper-connections")
 parser.add_argument("--hc-disable", action="store_true", help="disable hyper-connections (use identity)")
 parser.add_argument("--mhc", action="store_true", help="enable manifold-constrained hyper-connections")
 parser.add_argument("--hc-geometric", action="store_true", help="use geometric-induced hyper-connections (dynamic H matrix)")
+parser.add_argument("--dynamic-H", action="store_true", help="enable dynamic H generation for regular hyper-connections (per-token)")
 parser.add_argument("--hc-manifold-dim", type=int, default=4, help="manifold dimension for geometric hyper-connections")
 parser.add_argument("--sinkhorn-iters", type=int, default=10, help="sinkhorn iterations")
 parser.add_argument("--sinkhorn-tau", type=float, default=0.05, help="sinkhorn tau")
@@ -169,17 +170,18 @@ model_config_kwargs = dict(
     n_kv_head=num_kv_heads,
     n_embd=model_dim, window_pattern=args.window_pattern,
     hc_num_streams=args.hc_num_streams,
-    hc_num_fracs=args.hc_num_fracs,
+    # hc_num_fracs=args.hc_num_fracs,
     hc_disable=args.hc_disable,
     mhc=args.mhc,
     hc_geometric=args.hc_geometric,
+    dynamic_H=args.dynamic_H,
     hc_manifold_dim=args.hc_manifold_dim,
     sinkhorn_iters=args.sinkhorn_iters,
     sinkhorn_tau=args.sinkhorn_tau,
     mhc_h_res_proj=args.mhc_h_res_proj,
     gradient_checkpointing=args.gradient_checkpointing,
     hc_h_mode=args.hc_h_mode,
-    hc_chunk_size=args.hc_chunk_size,
+    # hc_chunk_size=args.hc_chunk_size,
     hc_pool_type=args.hc_pool_type,
 )
 with torch.device("meta"):

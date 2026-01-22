@@ -6,7 +6,7 @@ from random import randrange
 import math
 
 import torch
-from torch import nn, cat
+from torch import nn, cat, Tensor
 import torch.nn.functional as F
 from torch.nn import Module, Sequential
 from torch.utils._pytree import tree_flatten, tree_unflatten
@@ -21,7 +21,6 @@ b - batch
 d - feature dimension
 s - residual streams
 t - residual streams + num branch inputs
-f - number of fractions (division of feature dimension space)
 v - number of views for branch input
 """
 
@@ -49,41 +48,69 @@ def add(x, y):
 
 
 def sinkhorn_log(logits, num_iters=10, tau=0.05):
+    """
+    Unified Sinkhorn-Knopp algorithm supporting both 2D and batched inputs.
+
+    Args:
+        logits: (n, n) or (..., n, n) - unnormalized log-probabilities
+        num_iters: Number of Sinkhorn iterations
+        tau: Temperature parameter
+
+    Returns:
+        (..., n, n) doubly-stochastic matrix
+    """
     n = logits.shape[-1]
     Z = logits / tau
     log_marginal = torch.full(
         (n,), -math.log(n), device=logits.device, dtype=logits.dtype
     )
 
-    u = torch.zeros(n, device=Z.device, dtype=Z.dtype)
-    v = torch.zeros(n, device=Z.device, dtype=Z.dtype)
+    # Initialize u, v with proper batch shape
+    batch_shape = logits.shape[:-2]
+    u = torch.zeros((*batch_shape, n), device=Z.device, dtype=Z.dtype)
+    v = torch.zeros((*batch_shape, n), device=Z.device, dtype=Z.dtype)
 
     for _ in range(num_iters):
-        u = log_marginal - torch.logsumexp(Z + v.unsqueeze(0), dim=1)
-        v = log_marginal - torch.logsumexp(Z + u.unsqueeze(1), dim=0)
+        u = log_marginal - torch.logsumexp(Z + v.unsqueeze(-2), dim=-1)
+        v = log_marginal - torch.logsumexp(Z + u.unsqueeze(-1), dim=-2)
 
-    return torch.exp(Z + u.unsqueeze(1) + v.unsqueeze(0)) * n
+    return torch.exp(Z + u.unsqueeze(-1) + v.unsqueeze(-2)) * n
 
 
 def zeropower_via_newtonschulz(X, steps=5, eps=1e-7, coeffs=(3.0, -3.2, 1.2)):
     a, b, c = coeffs
 
-    X = X / (X.norm() + eps)
-
-    transpose = False
-    if X.shape[0] > X.shape[1]:
-        X = X.T
-        transpose = True
-
-    for _ in range(steps):
-        A = X @ X.T
-        B = b * A + c * A @ A
-        X = a * X + B @ X
-
-    if transpose:
-        X = X.T
-
-    return X
+    # 支持批量输入 (batch, n, n) 或单个 (n, n)
+    if X.dim() == 2:
+        X = X / (X.norm() + eps)
+        transpose = False
+        if X.shape[0] > X.shape[1]:
+            X = X.T
+            transpose = True
+        for _ in range(steps):
+            A = X @ X.T
+            B = b * A + c * A @ A
+            X = a * X + B @ X
+        if transpose:
+            X = X.T
+        return X
+    elif X.dim() == 3:
+        # (batch, n, n)
+        batch = X.shape[0]
+        X_norm = X.norm(dim=(1,2), keepdim=True) + eps
+        X = X / X_norm
+        transpose = X.shape[1] > X.shape[2]
+        if transpose:
+            X = X.transpose(1,2)
+        for _ in range(steps):
+            A = X @ X.transpose(1,2)
+            B = b * A + c * (A @ A)
+            X = a * X + B @ X
+        if transpose:
+            X = X.transpose(1,2)
+        return X
+    else:
+        raise ValueError("Input must be 2D or 3D tensor")
 
 
 def orthostochastic_project(
@@ -119,13 +146,54 @@ def get_expand_reduce_stream_functions(
 
 
 def get_init_and_expand_reduce_stream_functions(
-    num_streams, num_fracs=1, dim=None, add_stream_embed=False, disable=None, gradient_checkpointing=False
+    num_streams,
+    dim=None,
+    add_stream_embed=False,
+    disable=None,
+    gradient_checkpointing=False,
+    dynamic_H=False,
+    # Geometric mode parameters
+    hc_geometric=False,
+    manifold_dim=4,
+    sigma_init=1.0,
+    sigma_learnable=True,
+    H_mode="per-token",
+    pool_type="last",
+    # MHC parameters
+    mhc=False,
+    sinkhorn_iters=10,
+    sinkhorn_tau=0.05,
+    mhc_h_res_proj="sinkhorn",
+    **kwargs  # Catch any other parameters
 ):
-    disable = default(disable, num_streams == 1 and num_fracs == 1)
+    """
+    Unified factory function for creating HyperConnections initialization function.
+
+    Supports three modes:
+    - Standard: Original learnable alpha/beta (when mhc=False, hc_geometric=False)
+    - MHC: manifold-constraint Hyper-Connections with static/dynamic/Geometry H (when mhc=True)
+    """
+    disable = default(disable, num_streams == 1)
 
     hyper_conn_klass = HyperConnections if not disable else Residual
 
-    init_hyper_conn_fn = partial(hyper_conn_klass, num_streams, num_fracs=num_fracs, gradient_checkpointing=gradient_checkpointing)
+    init_hyper_conn_fn = partial(
+        hyper_conn_klass,
+        num_streams,
+        gradient_checkpointing=gradient_checkpointing,
+        dynamic_H=dynamic_H,
+        hc_geometric=hc_geometric,
+        manifold_dim=manifold_dim,
+        sigma_init=sigma_init,
+        sigma_learnable=sigma_learnable,
+        H_mode=H_mode,
+        pool_type=pool_type,
+        mhc=mhc,
+        sinkhorn_iters=sinkhorn_iters,
+        sinkhorn_tau=sinkhorn_tau,
+        mhc_h_res_proj=mhc_h_res_proj,
+        **kwargs
+    )
     expand_reduce_fns = get_expand_reduce_stream_functions(
         num_streams, add_stream_embed=add_stream_embed, dim=dim, disable=disable
     )
@@ -210,6 +278,68 @@ class Residual(Module):
 
 # hyper connection residual streams
 
+"""
+Hyper Connections:
+
+general steps:
+
+x: inputs (b, ..., d) -> expand to residual streams (b, ..., s, d)
+
+Width connection set the branch input and mix residual streams:
+residuals: (b, ..., s, d) -> branch_input: (b, ..., d)
+
+Depth connection adds branch output back to residual streams:
+branch_output: (b, ..., d), residuals: (b, ..., s, d) -> new_residuals: (b, ..., s, d)
+
+Then reduce residual streams back to original shape:
+new_residuals: (b, ..., s, d) -> (b, ..., d)
+
+There are several modes:
+- Standard mode (Static/Dynamic, whether dependent on input or not)
+- MHC mode (manifold-constraint Hyper-Connections)
+    - Static/Dynamic 
+    - Geometric
+
+The standard mode is the original Hyper-Connections paper:
+    https://arxiv.org/pdf/2409.19606
+
+They learn two vector and a matrix to control the width and depth connections:
+    - Alpha: width connection weights from each residual stream and branch inputs to each residual stream
+    - Beta: depth connection weights from branch output back to each residual stream
+    - A: residual mixing matrix to mix residual streams before width connection
+    
+    In the dynamic setting:
+    - beta(x) = s_beta \\circ tanh(norm(x) @ W_beta)^T + beta_static : (1, s)
+    - alpha(x) = s_alpha \\circ tanh(norm(x) @ W_alpha) + alpha_static : (s, 1)
+    - A(x)= s_alpha \\circ tanh(norm(x) @ W_A) + A_static : (s, s)
+
+The MHC mode introduces manifold constraints on the residual mixing matrix A:
+    - A is constrained to be a doubly-stochastic matrix on the probability simplex
+    - Achieved via Sinkhorn-Knopp algorithm or orthostochastic projection
+    
+    The static is parameterized as logits, which is easy.
+    In the dynamic setting:
+        - First, the stream is flattened and RMSNormed as x (..., s, d) -> (..., s * d)
+        - Then three linear projections are applied to generate the logits for H_res, H_pre, H_post
+        - Finally, the logits are projected to the desired form:
+            - H_res: doubly-stochastic matrix via Sinkhorn/orthostochastic
+            - H_pre: sigmoid to (0, 1)
+            - H_post: sigmoid * 2 to (0, 2)
+    
+    alpha <-> H_pre
+    beta <-> H_post
+    A <-> H_res
+
+    Geometric mode:
+    - Introduce a manifold projection head to project each residual stream to a low-dimensional manifold
+    - Compute pairwise distances between residual streams in the manifold space
+    - Use Gaussian kernel to compute similarity logits
+    - Apply Sinkhorn-Knopp to get doubly-stochastic H_res
+        Choices for granularity: 
+            - per-token: each token has its own H_res
+            - per-seq: each sequence has its own H_res (pool over "mean", "max", "last")
+"""
+
 
 class HyperConnections(Module):
     def __init__(
@@ -227,8 +357,8 @@ class HyperConnections(Module):
         add_branch_out_to_residual=True,  # will disable depth connections (weighted residual sum with beta) if set False
         num_input_views=1,  # allow for the branch module to receive multiple input views, dimension placed on the very left (before batch)
         depth_residual_fn=add,
-        num_fracs=1,  # https://arxiv.org/abs/2503.14125
         mhc=False,
+        dynamic_H=False,  # enable dynamic H generation for mhc mode
         sinkhorn_iters=10,
         sinkhorn_tau=0.05,
         mhc_h_res_proj="sinkhorn",
@@ -236,6 +366,13 @@ class HyperConnections(Module):
         ns_eps=1e-7,
         ns_coeffs=(3.0, -3.2, 1.2),
         gradient_checkpointing=False,
+        # Geometric mode parameters
+        hc_geometric=False,  # enable geometric-induced HC
+        manifold_dim=4,  # manifold dimension for geometric projection
+        sigma_init=1.0,  # initial RBF bandwidth
+        sigma_learnable=True,  # whether sigma is learnable
+        H_mode="per-token",  # geometric H granularity: per-token/per-seq
+        pool_type="last",  # pooling type: mean/max/last
     ):
         """
         Appendix J, Algorithm2 in - https://arxiv.org/abs/2409.19606
@@ -246,25 +383,8 @@ class HyperConnections(Module):
 
         self.act = nn.Tanh() if tanh else nn.Identity()
 
-        # frac-connections paper - num_fracs > 1 will be the `m` in their paper https://arxiv.org/abs/2503.14125
-
-        assert num_fracs >= 1
-
-        self.num_fracs = num_fracs
-        self.has_fracs = num_fracs > 1
-
-        self.split_fracs = Rearrange("b ... (f d) -> b ... f d", f=num_fracs)
-        self.merge_fracs = Rearrange("b ... f d -> b ... (f d)")
-
-        assert divisible_by(dim, num_fracs), (
-            f"feature dimension ({dim}) must be divisible by the `num_fracs` ({num_fracs})"
-        )
-
-        dim //= num_fracs  # effective dim handled in dimension is feature dimension divided by num fractions
-
-        # they used layernorm in paper, but rmsnorm is fine given what we know now
-
-        if not mhc:
+        # RMSNorm for standard mode
+        if not mhc and not hc_geometric:
             self.norm = RMSNorm(dim)
 
         assert num_residual_streams > 0, "`num_residual_streams` must be greater than 0"
@@ -274,11 +394,6 @@ class HyperConnections(Module):
             default(layer_index, randrange(num_residual_streams)) % num_residual_streams
         )  # just choose one random residual stream if layer index not given
 
-        # handle the parameter dimensions, which may require (num_residuals x num_fractions) - generalizing hyper + frac connections
-
-        num_residual_streams_fracs = num_residual_streams * num_fracs
-        num_input_views_fracs = num_input_views * num_fracs
-
         # width num residual streams
 
         assert num_input_views >= 1
@@ -286,16 +401,16 @@ class HyperConnections(Module):
 
         # width connection
 
-        if not mhc:
-            init_alpha0 = torch.zeros((num_residual_streams_fracs, num_input_views_fracs))
+        if not mhc and not hc_geometric:
+            init_alpha0 = torch.zeros((num_residual_streams, num_input_views))
             init_alpha0[init_residual_index, :] = 1.0
 
             self.static_alpha = nn.Parameter(
-                cat((init_alpha0, torch.eye(num_residual_streams_fracs)), dim=1)
+                cat((init_alpha0, torch.eye(num_residual_streams)), dim=1)
             )
 
             self.dynamic_alpha_fn = nn.Parameter(
-                torch.zeros(dim, num_residual_streams_fracs + num_input_views_fracs)
+                torch.zeros(dim, num_residual_streams + num_input_views)
             )
             self.dynamic_alpha_scale = nn.Parameter(torch.ones(()) * 1e-2)
 
@@ -303,32 +418,18 @@ class HyperConnections(Module):
 
         self.add_branch_out_to_residual = add_branch_out_to_residual
 
-        if add_branch_out_to_residual and not mhc:
-            self.static_beta = nn.Parameter(torch.ones(num_residual_streams_fracs))
-
-            dynamic_beta_shape = (
-                (dim,) if num_fracs == 1 else (dim, num_fracs)
-            )  # preserve backwards compat
-            self.dynamic_beta_fn = nn.Parameter(torch.zeros(dynamic_beta_shape))
-
+        if add_branch_out_to_residual and not mhc and not hc_geometric:
+            self.static_beta = nn.Parameter(torch.ones(num_residual_streams))
+            self.dynamic_beta_fn = nn.Parameter(torch.zeros(dim))
             self.dynamic_beta_scale = nn.Parameter(torch.ones(()) * 1e-2)
 
-        # dropouts
-
         self.dropout = nn.Dropout(dropout)
-
-        # channel first option
-
         self.channel_first = channel_first
-
-        # maybe residual transform
-
         self.residual_transform = default(residual_transform, nn.Identity())
 
         # maybe custom depth connection residual function
         # this is to prepare for gating the addition of the branch outputs to the residual streams
         # needed for memory lanes a la RMT / LMM
-
         self.depth_residual_fn = depth_residual_fn
 
         self.mhc = mhc
@@ -339,30 +440,190 @@ class HyperConnections(Module):
         self.ns_eps = ns_eps
         self.ns_coeffs = ns_coeffs
         self.gradient_checkpointing = gradient_checkpointing
+        
+        # Geometric 
+        self.hc_geometric = hc_geometric
 
         if mhc:
-            assert num_fracs == 1, "mhc currently requires num_fracs = 1"
             assert num_input_views == 1, "mhc currently requires num_input_views = 1"
             assert mhc_h_res_proj in (
                 "sinkhorn",
                 "orthostochastic",
             ), "mhc_h_res_proj must be 'sinkhorn' or 'orthostochastic'"
 
+            # 静态 H 参数（作为 beta，即 bias）
             H_res_init = torch.full((num_residual_streams, num_residual_streams), -8.0)
             H_res_init.fill_diagonal_(0.0)
-            self.H_res_logits = nn.Parameter(H_res_init)
+            self.H_res_beta = nn.Parameter(H_res_init)
 
             H_pre_init = torch.full((num_residual_streams,), -8.0)
             H_pre_init[init_residual_index] = 0.0
-            self.H_pre_logits = nn.Parameter(H_pre_init)
+            self.H_pre_beta = nn.Parameter(H_pre_init)
 
             if add_branch_out_to_residual:
-                self.H_post_logits = nn.Parameter(torch.zeros(num_residual_streams))
+                self.H_post_beta = nn.Parameter(torch.zeros(num_residual_streams))
+
+            # 动态 H 生成（可选）
+            self.dynamic_H = dynamic_H
+            if self.dynamic_H:
+                # RMSNorm for flattened input
+                self.H_norm = RMSNorm(num_residual_streams * dim)
+
+                # 三个线性投影层
+                self.H_res_proj = nn.Linear(
+                    num_residual_streams * dim,
+                    num_residual_streams * num_residual_streams,
+                    bias=False
+                )
+                self.H_pre_proj = nn.Linear(
+                    num_residual_streams * dim,
+                    num_residual_streams,
+                    bias=False
+                )
+                if add_branch_out_to_residual:
+                    self.H_post_proj = nn.Linear(
+                        num_residual_streams * dim,
+                        num_residual_streams,
+                        bias=False
+                    )
+
+                # Alpha (scalar weights) - 控制动态部分的强度
+                self.H_res_alpha = nn.Parameter(torch.ones(()) * 1e-2)
+                self.H_pre_alpha = nn.Parameter(torch.ones(()) * 1e-2)
+                if add_branch_out_to_residual:
+                    self.H_post_alpha = nn.Parameter(torch.ones(()) * 1e-2)
+
+                # 初始化投影层为小值
+                nn.init.normal_(self.H_res_proj.weight, std=0.02)
+                nn.init.normal_(self.H_pre_proj.weight, std=0.02)
+                if add_branch_out_to_residual:
+                    nn.init.normal_(self.H_post_proj.weight, std=0.02)
+                    
+            elif self.hc_geometric:
+
+                # Geometric parameters
+                self.manifold_dim = manifold_dim
+                self.H_mode = H_mode
+                self.pool_type = pool_type
+
+                # RMSNorm and manifold projection
+                self.norm = RMSNorm(dim)
+                self.proj_head = nn.Linear(dim, manifold_dim, bias=False)
+                nn.init.normal_(self.proj_head.weight, std=0.02)
+
+                if sigma_learnable:
+                    self.log_sigma = nn.Parameter(torch.tensor(math.log(sigma_init)))
+                else:
+                    self.register_buffer('log_sigma', torch.tensor(math.log(sigma_init)))
+
+    @property
+    def sigma(self) -> Tensor:
+        """Get current sigma value (for geometric mode)"""
+        return self.log_sigma.exp()
+
+    def _pool(self, x, dim):
+        """Pooling helper for geometric mode"""
+        if self.pool_type == 'mean':
+            return x.mean(dim=dim, keepdim=True)
+        elif self.pool_type == 'max':
+            return x.max(dim=dim, keepdim=True).values
+        elif self.pool_type == 'last':
+            return x.narrow(dim, x.shape[dim] - 1, 1)
+        else:
+            raise ValueError(f"Unknown pool_type: {self.pool_type}")
+
+    def _compute_geometric_H(self, residuals):
+        """
+        Compute geometry-induced H matrix.
+        Args: residuals after rearrange: (b, T, s, d)
+        Returns: H_res, H_pre, H_post
+        """
+        if residuals.ndim == 3:
+            # (b, s, d) - add time dimension
+            residuals = residuals.unsqueeze(1)  # (b, 1, s, d)
+
+        b, T, s, d = residuals.shape
+
+        if self.H_mode == 'per-token':
+            normed = self.norm(residuals)
+            coords = self.proj_head(normed)  # (b, T, s, k)
+            dist_sq = torch.cdist(coords, coords, p=2) ** 2 # (b, T, s, s)
+            H_res_logits = -dist_sq / (2 * self.sigma ** 2)
+            H_res = sinkhorn_log(H_res_logits, self.sinkhorn_iters, self.sinkhorn_tau)
+
+        elif self.H_mode == 'per-seq':
+            pooled = self._pool(residuals, dim=1)  # (b, 1, s, d)
+            normed = self.norm(pooled)
+            coords_seq = self.proj_head(normed).squeeze(1)  # (b, s, k)
+            dist_sq = torch.cdist(coords_seq, coords_seq, p=2) ** 2
+            H_res_logits = -dist_sq / (2 * self.sigma ** 2)
+            H_res = sinkhorn_log(H_res_logits, self.sinkhorn_iters, self.sinkhorn_tau)
+        else:
+            raise ValueError(f"Unknown H_mode: {self.H_mode}")
+
+                        
+        H_pre = F.softmax(self.H_pre_beta, dim=-1)
+        H_post = F.softmax(self.H_post_beta, dim=-1) if self.add_branch_out_to_residual else None
+
+        return H_res, H_pre, H_post
+
+    def _compute_dynamic_H(self, residuals):
+        """
+        Per-token dynamic H generation
+        Args: residuals (b, ..., s, d)
+        Returns: H_res (b, ..., s, s), H_pre (b, ..., s), H_post (b, ..., s) or None
+        """
+        s = self.num_residual_streams
+
+        # 1. Flatten: (b, ..., s, d) -> (b, ..., s*d)
+        residuals_flat = rearrange(residuals, "... s d -> ... (s d)")
+
+        # 2. RMSNorm
+        normed = self.H_norm(residuals_flat)
+
+        # 3. Linear projections
+        H_res_proj = self.H_res_proj(normed)  # (b, ..., s*s)
+        H_pre_proj = self.H_pre_proj(normed)  # (b, ..., s)
+        H_post_proj = self.H_post_proj(normed) if self.add_branch_out_to_residual else None
+
+        # 4. Modulate: alpha * dynamic + beta
+        H_res_logits = (
+            H_res_proj.view(*H_res_proj.shape[:-1], s, s) * self.H_res_alpha
+            + self.H_res_beta
+        )
+        H_pre_logits = H_pre_proj * self.H_pre_alpha + self.H_pre_beta
+        if H_post_proj is not None:
+            H_post_logits = H_post_proj * self.H_post_alpha + self.H_post_beta
+        else:
+            H_post_logits = None
+
+        # 5. Activations
+        # H_res: Sinkhorn normalization (works directly on logits)
+        if self.mhc_h_res_proj == "sinkhorn":
+            H_res = sinkhorn_log(H_res_logits, self.sinkhorn_iters, self.sinkhorn_tau)
+        elif self.mhc_h_res_proj == "orthostochastic":
+            H_res = orthostochastic_project(
+                H_res_logits,
+                ns_steps=self.ns_steps,
+                ns_eps=self.ns_eps,
+                ns_coeffs=self.ns_coeffs,
+            )
+        else:
+            raise ValueError(f"Unknown mhc_h_res_proj: {self.mhc_h_res_proj}")
+
+        # H_pre: sigmoid
+        H_pre = torch.sigmoid(H_pre_logits)
+
+        # H_post: sigmoid * 2
+        H_post = torch.sigmoid(H_post_logits) * 2 if H_post_logits is not None else None
+
+        return H_res, H_pre, H_post
 
     def width_connection(self, residuals):
         streams = self.num_residual_streams
 
         maybe_transformed_residuals = self.residual_transform(residuals)
+        # (b, ..., d) or (b, d, ...)
 
         # width connection
 
@@ -371,194 +632,143 @@ class HyperConnections(Module):
         if self.channel_first:
             residuals = rearrange(residuals, "b d ... -> b ... d")
 
-        # split out fractions
-
-        residuals = self.split_fracs(residuals)
-
         # split out streams
 
         residuals = rearrange(residuals, "(b s) ... d -> b ... s d", s=streams)
 
-        if self.mhc:
+        if self.hc_geometric or self.mhc:
             residuals_mixed_source = maybe_transformed_residuals
 
             if self.channel_first:
                 residuals_mixed_source = rearrange(
                     residuals_mixed_source, "b d ... -> b ... d"
                 )
-
-            residuals_mixed_source = self.split_fracs(residuals_mixed_source)
             residuals_mixed_source = rearrange(
                 residuals_mixed_source, "(b s) ... d -> b ... s d", s=streams
             )
+            if self.hc_geometric:
+                # Compute geometric H matrices
+                if self.gradient_checkpointing and self.training:
+                    H_res, H_pre, H_post = checkpoint(
+                        self._compute_geometric_H, residuals, use_reentrant=False
+                    )
+                else:
+                    H_res, H_pre, H_post = self._compute_geometric_H(residuals)
+            else:
+                if self.dynamic_H:
+                    # Per-token dynamic H
+                    H_res, H_pre, H_post = self._compute_dynamic_H(residuals)
+                else:
+                    # 静态 H (原始实现)
+                    if self.mhc_h_res_proj == "orthostochastic":
+                        H_res = orthostochastic_project(
+                            self.H_res_beta,
+                            ns_steps=self.ns_steps,
+                            ns_eps=self.ns_eps,
+                            ns_coeffs=self.ns_coeffs,
+                        )
+                    else:
+                        H_res = sinkhorn_log(
+                            self.H_res_beta, self.sinkhorn_iters, self.sinkhorn_tau
+                        )
+                        
+                    H_pre = F.softmax(self.H_pre_beta, dim=-1)
+                    H_post = F.softmax(self.H_post_beta, dim=-1) if self.add_branch_out_to_residual else None
 
-            if self.mhc_h_res_proj == "orthostochastic":
-                H_res = orthostochastic_project(
-                    self.H_res_logits,
-                    ns_steps=self.ns_steps,
-                    ns_eps=self.ns_eps,
-                    ns_coeffs=self.ns_coeffs,
+            if H_res.ndim == 2:
+                # Static H_res: (s, s)
+                residuals_mixed = einsum(
+                    H_res, residuals_mixed_source, "s t, b ... s d -> b ... t d"
+                )
+                branch_input = einsum(
+                    H_pre, residuals, "s, b ... s d -> b ... d"
+                )
+            elif H_res.ndim == 3: # per-seq and geometric
+                # per-seq
+                residuals_mixed = einsum(
+                    H_res, residuals_mixed_source, "b s t, b ... s d -> b ... t d"
+                )
+                branch_input = einsum(
+                    H_pre, residuals, "s, b ... s d -> b ... d"
                 )
             else:
-                H_res = sinkhorn_log(
-                    self.H_res_logits, self.sinkhorn_iters, self.sinkhorn_tau
+                # per-token
+                residuals_mixed = einsum(
+                    H_res, residuals_mixed_source, "b ... s t, b ... s d -> b ... t d"
                 )
-            H_pre = F.softmax(self.H_pre_logits, dim=-1)
-
-            H_post = None
-            if self.add_branch_out_to_residual:
-                H_post = F.softmax(self.H_post_logits, dim=-1)
-
-            residuals_mixed = einsum(
-                H_res, residuals_mixed_source, "s t, ... s d -> ... t d"
-            )
-            branch_input = einsum(H_pre, residuals, "s, ... s d -> ... d")
-
-            if getattr(self, "collect_stats", False):
-                with torch.no_grad():
-                    stats = dict(
-                        h_res_min=H_res.min(),
-                        h_res_row_sum=H_res.sum(dim=-1).mean(),
-                        h_res_col_sum=H_res.sum(dim=-2).mean(),
-                        h_pre_min=H_pre.min(),
-                    )
-                    if H_post is not None:
-                        stats["h_post_min"] = H_post.min()
-                    self.last_stats = {k: v.detach() for k, v in stats.items()}
+                branch_input = einsum(
+                    H_pre, residuals, "b ... s, b ... s d -> b ... d"
+                )
+                
 
             if self.channel_first:
                 branch_input = rearrange(branch_input, "b ... d -> b d ...")
 
-            branch_input = self.merge_fracs(branch_input)
-
             return (
-                branch_input,
-                maybe_transformed_residuals,
-                dict(beta=H_post, residuals_mixed=residuals_mixed),
+                branch_input, 
+                maybe_transformed_residuals, 
+                dict(beta=H_post, residuals_mixed=residuals_mixed)
             )
 
+        # --- standard mode ---
+        
         # norm
 
         normed = self.norm(residuals)
 
         # alpha for weighted sum of residuals going into branch
 
-        wc_weight = self.act(normed @ self.dynamic_alpha_fn)
-        dynamic_alpha = wc_weight * self.dynamic_alpha_scale
-
-        static_alpha = rearrange(self.static_alpha, "(f s) d -> f s d", s=streams)
-
-        alpha = dynamic_alpha + static_alpha
-
-        alpha = self.split_fracs(
-            alpha
-        )  # (batch, seq, fracs1, streams, fracs2, input + residual streams)
+        dynamic_alpha = self.act(normed @ self.dynamic_alpha_fn) * self.dynamic_alpha_scale
+        alpha = dynamic_alpha + self.static_alpha
 
         # beta for weights from branch output back to residual streams
-
         beta = None
-
         if self.add_branch_out_to_residual:
-            dc_weight = self.act(normed @ self.dynamic_beta_fn)
-
-            if not self.has_fracs:
-                dc_weight = rearrange(dc_weight, "... -> ... 1")
-
-            dynamic_beta = dc_weight * self.dynamic_beta_scale
-
-            static_beta = rearrange(self.static_beta, "... (s f) -> ... s f", s=streams)
-
-            beta = dynamic_beta + static_beta
-
-        if getattr(self, "collect_stats", False):
-            with torch.no_grad():
-                num_input_views_fracs = self.num_input_views * self.num_fracs
-                alpha_branch = alpha[..., :num_input_views_fracs]
-                alpha_residual = alpha[..., num_input_views_fracs:]
-                alpha_branch_abs_mean = alpha_branch.abs().mean()
-                alpha_residual_abs_mean = alpha_residual.abs().mean()
-                stats = dict(
-                    alpha_branch_mean=alpha_branch.mean(),
-                    alpha_branch_abs_mean=alpha_branch_abs_mean,
-                    alpha_residual_mean=alpha_residual.mean(),
-                    alpha_residual_abs_mean=alpha_residual_abs_mean,
-                    alpha_branch_residual_ratio=alpha_branch_abs_mean
-                    / (alpha_residual_abs_mean + 1e-8),
-                )
-                if beta is not None:
-                    stats.update(
-                        beta_mean=beta.mean(),
-                        beta_abs_mean=beta.abs().mean(),
-                        beta_min=beta.min(),
-                        beta_max=beta.max(),
-                    )
-                self.last_stats = {k: v.detach() for k, v in stats.items()}
-
-        mix_h = einsum(alpha, residuals, "... f1 s f2 t, ... f1 s d -> ... f2 t d")
+            dynamic_beta = self.act(normed @ self.dynamic_beta_fn) * self.dynamic_beta_scale
+            beta = dynamic_beta + self.static_beta
+        
+        mix_h = einsum(alpha, residuals, "... s t, ... s d -> ... t d")
 
         if self.num_input_views == 1:
-            branch_input, residuals = mix_h[..., 0, :], mix_h[..., 1:, :]
+            branch_input, residuals_next = mix_h[..., 0, :], mix_h[..., 1:, :]
         else:
-            branch_input, residuals = (
+            branch_input, residuals_next = (
                 mix_h[..., : self.num_input_views, :],
                 mix_h[..., self.num_input_views :, :],
             )
             branch_input = rearrange(branch_input, "b ... v d -> v b ... d")
+            # Residuals next shape: (b, T, s, d)
 
         if self.channel_first:
             branch_input = rearrange(branch_input, "b ... d -> b d ...")
 
-        # maybe merge fractions back
-
-        branch_input = self.merge_fracs(branch_input)
-
-        return branch_input, maybe_transformed_residuals, dict(beta=beta)
+        return branch_input, maybe_transformed_residuals, dict(beta=beta, residuals_mixed=residuals_next)
 
     def depth_connection(self, branch_output, residuals, *, beta, residuals_mixed=None):
         assert self.add_branch_out_to_residual
-
-        # maybe split fractions
-
-        branch_output = self.split_fracs(branch_output)
 
         # 'depth' connection
 
         if self.channel_first:
             branch_output = rearrange(branch_output, "b d ... -> b ... d")
-
-        if self.mhc:
-            assert residuals_mixed is not None
-            assert beta is not None
-
+            
+        # --- Standard mode ---
+        # beta shape: (s,) or dynamically computed
+        if beta.ndim == 1:
+            # Static beta: (s,)
             branch_to_streams = einsum(branch_output, beta, "b ... d, s -> b ... s d")
-            output = residuals_mixed + branch_to_streams
-            output = rearrange(output, "b ... s d -> (b s) ... d")
+        else:
+            # Dynamic beta: (b, ..., s)
+            branch_to_streams = einsum(branch_output, beta, "b ... d, b ... s -> b ... s d")
 
-            output = self.merge_fracs(output)
-
-            if self.channel_first:
-                output = rearrange(output, "b ... d -> b d ...")
-
-            return self.dropout(output)
-
-        output = einsum(
-            branch_output, beta, "b ... f1 d, b ... f1 s f2 -> b ... f2 s d"
-        )
-
+        output = self.depth_residual_fn(branch_to_streams, residuals_mixed)
+        
         output = rearrange(output, "b ... s d -> (b s) ... d")
-
-        # merge merge back fractions
-
-        output = self.merge_fracs(output)
-
-        # channel first
 
         if self.channel_first:
             output = rearrange(output, "b ... d -> b d ...")
 
-        residuals = self.depth_residual_fn(output, residuals)
-
-        return self.dropout(residuals)
+        return self.dropout(output)
 
     def decorate_branch(self, branch: Callable):
         assert not exists(self.branch), "branch was already wrapped on init"

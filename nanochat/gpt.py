@@ -20,7 +20,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from hyper_connections import get_init_and_expand_reduce_stream_functions
-from hyper_connections import geometric_get_init_and_expand_reduce_stream_functions
 from nanochat.common import get_dist_info, print0
 from nanochat.muon import Muon, DistMuon
 from nanochat.adamw import DistAdamW
@@ -42,13 +41,14 @@ class GPTConfig:
     
     # hyper-connections
     hc_num_streams: int = 1
-    hc_num_fracs: int = 1
+    # hc_num_fracs: int = 1
     hc_disable: bool = False
     mhc: bool = False
     hc_geometric: bool = False  # use geometric-induced hyper-connections
+    dynamic_H: bool = False  # enable dynamic H generation for regular hyper-connections
     hc_manifold_dim: int = 4  # manifold dimension for geometric HC
     hc_h_mode: str = "per-token"
-    hc_chunk_size: int = 8
+    # hc_chunk_size: int = 8
     hc_pool_type: str = "mean"
     sinkhorn_iters: int = 10
     sinkhorn_tau: float = 0.05
@@ -248,28 +248,25 @@ class GPT(nn.Module):
         if padded_vocab_size != config.vocab_size:
             print0(f"Padding vocab_size from {config.vocab_size} to {padded_vocab_size} for efficiency")
 
-        if config.hc_geometric:
-            # Use geometric-induced hyper-connections
-            init_hc, expand_stream, reduce_stream = (
-                geometric_get_init_and_expand_reduce_stream_functions(
-                    config.hc_num_streams,
-                    disable=config.hc_disable,
-                    gradient_checkpointing=config.gradient_checkpointing,
-                    H_mode=config.hc_h_mode,
-                    chunk_size=config.hc_chunk_size,
-                    pool_type=config.hc_pool_type,
-                )
+        # Use unified factory function (supports all modes)
+        init_hc, expand_stream, reduce_stream = (
+            get_init_and_expand_reduce_stream_functions(
+                config.hc_num_streams,
+                # num_fracs=config.hc_num_fracs,
+                disable=config.hc_disable,
+                gradient_checkpointing=config.gradient_checkpointing,
+                dynamic_H=config.dynamic_H,
+                hc_geometric=config.hc_geometric,
+                manifold_dim=config.hc_manifold_dim,
+                H_mode=config.hc_h_mode,
+                # chunk_size=config.hc_chunk_size,
+                pool_type=config.hc_pool_type,
+                mhc=config.mhc,
+                sinkhorn_iters=config.sinkhorn_iters,
+                sinkhorn_tau=config.sinkhorn_tau,
+                mhc_h_res_proj=config.mhc_h_res_proj,
             )
-        else:
-            # Use original hyper-connections
-            init_hc, expand_stream, reduce_stream = (
-                get_init_and_expand_reduce_stream_functions(
-                    config.hc_num_streams,
-                    num_fracs=config.hc_num_fracs,
-                    disable=config.hc_disable,
-                    gradient_checkpointing=config.gradient_checkpointing,
-                )
-            )
+        )
         self.expand_stream = expand_stream
         self.reduce_stream = reduce_stream
 
@@ -432,16 +429,40 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             for name, param in block.named_parameters():
                 # heuristics to distinguish between the "main" weights (Muon) and everything else (AdamW)
-                # The main weights are in the attention and findings (c_q, c_k, c_v, c_proj, c_fc)
+                # The main weights are in the attention and MLP (c_q, c_k, c_v, c_proj, c_fc)
                 # We identify them by the fact that they are in the 'branch' submodules
+                #
+                # Also include HyperConnections matrix parameters:
+                #   - proj_head.weight: GeometricHC projection matrix
+                #   - dynamic_alpha_fn: regular HC alpha projection matrix
+                #   - dynamic_beta_fn: regular HC beta projection matrix
+                #   - H_res_proj.weight: dynamic HC H_res projection
+                #   - H_pre_proj.weight: dynamic HC H_pre projection
+                #   - H_post_proj.weight: dynamic HC H_post projection
                 # print0(f"DEBUG: param name: {name}")
-                if "branch.attn" in name or "branch.mlp" in name or "attn.c_" in name or "mlp.c_" in name:
+                if "branch.attn" in name or "branch.mlp" in name or \
+                   "attn.c_" in name or "mlp.c_" in name or \
+                   "proj_head.weight" in name or \
+                   "dynamic_alpha_fn" in name or \
+                   "dynamic_beta_fn" in name or \
+                   "H_res_proj.weight" in name or \
+                   "H_pre_proj.weight" in name or \
+                   "H_post_proj.weight" in name:
                     matrix_params.append(param)
                 else:
-                    # this includes HyperConnections parameters (alphas, betas, etc)
+                    # this includes other HyperConnections parameters (static_alpha, scales, logits, etc)
                     embedding_params.append(param)
         
-        # assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params)
+        # Debug: print parameter counts
+        print0(f"Parameter grouping:")
+        print0(f"  Matrix params (Muon): {len(matrix_params)} tensors, {sum(p.numel() for p in matrix_params):,} elements")
+        print0(f"  Embedding params (AdamW): {len(embedding_params)} tensors, {sum(p.numel() for p in embedding_params):,} elements")
+        print0(f"  LM head params (AdamW): {len(lm_head_params)} tensors, {sum(p.numel() for p in lm_head_params):,} elements")
+        total_params_check = sum(p.numel() for p in matrix_params) + sum(p.numel() for p in embedding_params) + sum(p.numel() for p in lm_head_params)
+        all_params = sum(p.numel() for p in self.parameters())
+        print0(f"  Total: {total_params_check:,} / {all_params:,} parameters")
+        assert total_params_check == all_params, f"Parameter count mismatch! {total_params_check} != {all_params}"
+
         # Create the AdamW optimizer for the embedding, lm_head, and per-layer scalars
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (having tuned the LRs for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
