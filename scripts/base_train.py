@@ -39,6 +39,8 @@ parser.add_argument("--hc-h-mode", type=str, default="per-token", choices=["per-
 parser.add_argument("--hc-pool-type", type=str, default="mean", choices=["mean", "max", "last"], help="Pooling type for H matrix: mean, max, or last")
 # Logging
 parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
+parser.add_argument("--wandb-entity", type=str, default=os.environ.get("WANDB_ENTITY", None), help="wandb entity (defaults to WANDB_ENTITY env var, or your default entity if unset)")
+parser.add_argument("--wandb-project", type=str, default="nanochat", help="wandb project name")
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
 # Model architecture
@@ -66,6 +68,7 @@ parser.add_argument("--warmup-ratio", type=float, default=0.0, help="ratio of it
 parser.add_argument("--warmdown-ratio", type=float, default=0.4, help="ratio of iterations for LR warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.0, help="final LR as fraction of initial LR")
 parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
+parser.add_argument("--wandb-resume-id", type=str, default="", help="wandb run id to resume from (only used if resuming from step)")
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
 parser.add_argument("--eval-tokens", type=int, default=20*524288, help="number of tokens to evaluate val loss on")
@@ -103,7 +106,13 @@ get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else l
 
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
-wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=args.run, config=user_config)
+if use_dummy_wandb:
+    wandb_run = DummyWandb()
+else:
+    if args.wandb_resume_id != "":
+        wandb_run = wandb.init(entity=args.wandb_entity, project=args.wandb_project, name=args.run, id=args.wandb_resume_id, resume="must")
+    else:
+        wandb_run = wandb.init(entity=args.wandb_entity, project=args.wandb_project, name=args.run)
 
 # Tokenizer will be useful for evaluation, also we need the vocab size
 tokenizer = get_tokenizer()

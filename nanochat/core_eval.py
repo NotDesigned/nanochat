@@ -161,10 +161,12 @@ def forward_model(model, input_ids):
     losses[:, -1] = float('nan')
     # Get the argmax predictions at each position
     predictions = outputs.argmax(dim=-1)
+    # Detach outputs to break any potential computational graph references
+    del outputs
     return losses, predictions
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def evaluate_example(idx, model, tokenizer, data, device, task_meta):
     """Evaluate a single example, return True if correct, False otherwise"""
     item = data[idx]
@@ -237,6 +239,11 @@ def evaluate_example(idx, model, tokenizer, data, device, task_meta):
         is_correct = pred_idx == item['gold']
     else:
         raise ValueError(f"Unsupported task type: {task_type}")
+
+    # Explicitly clean up GPU tensors to release memory
+    del input_ids, losses, predictions
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
 
     return is_correct
 
