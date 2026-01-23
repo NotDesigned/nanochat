@@ -84,9 +84,9 @@ NPROC_PER_NODE=${NPROC_PER_NODE:-1}
 # torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- --depth=20 --target-param-data-ratio=20 --run=$WANDB_RUN \
     # --mhc --hc-num-streams=8 --device-batch-size=8
 torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- --depth=20 --target-param-data-ratio=20 \
-    --device-batch-size=8 --eval-tokens=65536 --max-seq-len=1024 --total-batch-size=131072 --num-iterations=-1 \
-    --mhc --hc-num-streams=512 --hc-geometric --hc-manifold-dim=8 --hc-h-mode per-seq \
-    --gradient-checkpointing \
+    --device-batch-size=1 --eval-tokens=65536 --max-seq-len=1024 --total-batch-size=131072 --num-iterations=-1 \
+    --mhc-mode=mhc-static --hc-num-streams=8 \
+    --mhc-sinkhorn-iters=10 \
     --eval-every=100 \
     --core-metric-every 500 \
     --core-metric-max-per-task 50 \
