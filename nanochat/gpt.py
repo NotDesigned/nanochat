@@ -192,10 +192,18 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
         if config.hc_geometric:
+            # Geometric is a variant of MHC, must set mhc=True
             hc_kwargs = dict(
+                mhc=True,  # Required for geometric mode
+                hc_geometric=True,
                 manifold_dim=config.hc_manifold_dim,
+                # Projection parameters (now shared by both geometric and dynamic)
+                mhc_h_res_proj=config.mhc_h_res_proj,
                 sinkhorn_iters=config.sinkhorn_iters,
                 sinkhorn_tau=config.sinkhorn_tau,
+                ns_steps=config.ns_steps,
+                ns_eps=config.ns_eps,
+                ns_coeffs=config.ns_coeffs,
             )
         else:
             hc_kwargs = dict(

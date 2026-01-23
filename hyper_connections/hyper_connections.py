@@ -82,8 +82,12 @@ def sinkhorn_log(logits, num_iters=10, tau=0.05):
 def zeropower_via_newtonschulz(X, steps=5, eps=1e-7, coeffs=(3.0, -3.2, 1.2)):
     a, b, c = coeffs
 
-    # 支持批量输入 (batch, n, n) 或单个 (n, n)
-    if X.dim() == 2:
+    # Support arbitrary batch dimensions: (..., n, n)
+    original_shape = X.shape
+    ndim = X.dim()
+
+    if ndim == 2:
+        # Single matrix (n, n)
         X = X / (X.norm() + eps)
         transpose = False
         if X.shape[0] > X.shape[1]:
@@ -96,23 +100,38 @@ def zeropower_via_newtonschulz(X, steps=5, eps=1e-7, coeffs=(3.0, -3.2, 1.2)):
         if transpose:
             X = X.T
         return X
-    elif X.dim() == 3:
-        # (batch, n, n)
-        batch = X.shape[0]
-        X_norm = X.norm(dim=(1,2), keepdim=True) + eps
+
+    elif ndim >= 3:
+        # Batch of matrices (..., n, n)
+        # Flatten all batch dimensions into one
+        batch_shape = original_shape[:-2]
+        n, m = original_shape[-2:]
+        X = X.reshape(-1, n, m)  # (batch_prod, n, m)
+
+        # Normalize
+        X_norm = X.norm(dim=(1, 2), keepdim=True) + eps
         X = X / X_norm
+
+        # Handle transpose if needed
         transpose = X.shape[1] > X.shape[2]
         if transpose:
-            X = X.transpose(1,2)
+            X = X.transpose(1, 2)
+
+        # Newton-Schulz iterations
         for _ in range(steps):
-            A = X @ X.transpose(1,2)
+            A = X @ X.transpose(1, 2)
             B = b * A + c * (A @ A)
             X = a * X + B @ X
+
         if transpose:
-            X = X.transpose(1,2)
+            X = X.transpose(1, 2)
+
+        # Unflatten back to original batch shape
+        X = X.reshape(*batch_shape, n, m)
         return X
+
     else:
-        raise ValueError("Input must be 2D or 3D tensor")
+        raise ValueError("Input must be at least 2D tensor")
 
 
 def orthostochastic_project(
@@ -554,7 +573,6 @@ class HyperConnections(Module):
             coords = self.proj_head(normed)  # (b, T, s, k)
             dist_sq = torch.cdist(coords, coords, p=2) ** 2 # (b, T, s, s)
             H_res_logits = -dist_sq / (2 * self.sigma ** 2)
-            H_res = sinkhorn_log(H_res_logits, self.sinkhorn_iters, self.sinkhorn_tau)
 
         elif self.H_mode == 'per-seq':
             pooled = self._pool(residuals, dim=1)  # (b, 1, s, d)
@@ -562,11 +580,23 @@ class HyperConnections(Module):
             coords_seq = self.proj_head(normed).squeeze(1)  # (b, s, k)
             dist_sq = torch.cdist(coords_seq, coords_seq, p=2) ** 2
             H_res_logits = -dist_sq / (2 * self.sigma ** 2)
-            H_res = sinkhorn_log(H_res_logits, self.sinkhorn_iters, self.sinkhorn_tau) # (b, s, s)
         else:
             raise ValueError(f"Unknown H_mode: {self.H_mode}")
 
-                        
+        # Apply projection to get doubly-stochastic H_res
+        # Support both sinkhorn and orthostochastic projections
+        if self.mhc_h_res_proj == "sinkhorn":
+            H_res = sinkhorn_log(H_res_logits, self.sinkhorn_iters, self.sinkhorn_tau)
+        elif self.mhc_h_res_proj == "orthostochastic":
+            H_res = orthostochastic_project(
+                H_res_logits,
+                ns_steps=self.ns_steps,
+                ns_eps=self.ns_eps,
+                ns_coeffs=self.ns_coeffs,
+            )
+        else:
+            raise ValueError(f"Unknown mhc_h_res_proj: {self.mhc_h_res_proj}")
+
         H_pre = F.softmax(self.H_pre_beta, dim=-1)
         H_post = F.softmax(self.H_post_beta, dim=-1) if self.add_branch_out_to_residual else None
 

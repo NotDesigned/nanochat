@@ -192,25 +192,55 @@ python -m scripts.tok_train --max-chars=2000000000 --vocab-size=65536
 | `--model-tag` | `None` | Override model tag for checkpoint directory (default: d{depth}) |
 
 #### HyperConnections (Advanced)
+
+**Basic:**
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `--hc-num-streams` | `1` | Number of hyper-connection streams |
-| `--hc-num-fracs` | `1` | Number of fractions for hyper-connections |
-| `--hc-disable` | `False` | Disable hyper-connections (use identity) |
-| `--mhc` | `False` | Enable manifold-constrained hyper-connections |
-| `--hc-geometric` | `False` | Use geometric-induced hyper-connections |
-| `--hc-manifold-dim` | `4` | Manifold dimension for geometric hyper-connections |
-| `--gradient-checkpointing` | `False` | Enable gradient checkpointing for HyperConnections |
-| `--sinkhorn-iters` | `10` | Sinkhorn iterations for MHC |
-| `--sinkhorn-tau` | `0.05` | Sinkhorn tau parameter |
-| `--mhc-h-res-proj` | `sinkhorn` | MHC projection method |
+| `--hc-num-streams` | `1` | Number of HC streams (1 = disabled, >1 = enabled) |
+| `--hc-disable` | `False` | Force disable hyper-connections |
+| `--gradient-checkpointing` | `False` | Enable gradient checkpointing for memory savings |
 
-**Example:**
+**Mode Selection:**
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--mhc-mode` | `standard` | HC mode: `standard` (learnable alpha/beta), `mhc-static` (static doubly-stochastic), `mhc-dynamic` (per-token dynamic), `mhc-geometric` (geometry-induced) |
+
+**Projection (for MHC modes):**
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--mhc-h-res-proj` | `sinkhorn` | Projection method: `sinkhorn` or `orthostochastic` |
+| `--mhc-sinkhorn-iters` | `10` | Sinkhorn iterations |
+| `--mhc-sinkhorn-tau` | `0.05` | Sinkhorn temperature |
+| `--mhc-ortho-steps` | `5` | Newton-Schulz steps for orthostochastic |
+| `--mhc-ortho-eps` | `1e-7` | Epsilon for orthostochastic projection |
+
+**Geometric-specific:**
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--hc-manifold-dim` | `4` | Manifold dimension (only for `mhc-geometric` mode) |
+
+**Examples:**
 ```bash
+# Standard training
 torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- \
   --depth=20 \
   --device-batch-size=32 \
   --target-param-data-ratio=20 \
+  --run=my_run
+
+# With MHC Static (8 streams)
+torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- \
+  --depth=20 \
+  --mhc-mode=mhc-static \
+  --hc-num-streams=8 \
+  --run=my_run
+
+# With MHC Geometric
+torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- \
+  --depth=20 \
+  --mhc-mode=mhc-geometric \
+  --hc-num-streams=4 \
+  --hc-manifold-dim=8 \
   --run=my_run
 ```
 

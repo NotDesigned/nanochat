@@ -74,25 +74,176 @@ parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bp
 parser.add_argument("--eval-tokens", type=int, default=20*524288, help="number of tokens to evaluate val loss on")
 parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluate CORE metric every N steps (-1 = disable)")
 parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
-parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
+parser.add_argument("--sample-every", type=int, default=1000, help="sample from model every N steps (-1 = disable)")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
 # Log
 parser.add_argument("--log-every", type=int, default=10, help="log training stats every N steps")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
-# HyperConnections
+# HyperConnections - Basic
 parser.add_argument("--hc-num-streams", type=int, default=1, help="number of hyper-connection streams")
-# parser.add_argument("--hc-num-fracs", type=int, default=1, help="number of fractions for hyper-connections")
 parser.add_argument("--hc-disable", action="store_true", help="disable hyper-connections (use identity)")
-parser.add_argument("--mhc", action="store_true", help="enable manifold-constrained hyper-connections")
-parser.add_argument("--hc-geometric", action="store_true", help="use geometric-induced hyper-connections (dynamic H matrix)")
-parser.add_argument("--dynamic-H", action="store_true", help="enable dynamic H generation for regular hyper-connections (per-token)")
-parser.add_argument("--hc-manifold-dim", type=int, default=4, help="manifold dimension for geometric hyper-connections")
-parser.add_argument("--sinkhorn-iters", type=int, default=10, help="sinkhorn iterations")
-parser.add_argument("--sinkhorn-tau", type=float, default=0.05, help="sinkhorn tau")
-parser.add_argument("--mhc-h-res-proj", type=str, default="sinkhorn", help="mhc projection method")
 parser.add_argument("--gradient-checkpointing", action="store_true", help="enable gradient checkpointing for HyperConnections")
+
+# HyperConnections - Mode Selection
+parser.add_argument("--mhc-mode", type=str, default="standard",
+    choices=["standard", "mhc-static", "mhc-dynamic", "mhc-geometric"],
+    help="Hyper-connections mode: standard (learnable alpha/beta), mhc-static (static doubly-stochastic H_res), mhc-dynamic (per-token dynamic H), mhc-geometric (geometry-induced H_res)")
+
+# MHC Projection - Method Selection
+parser.add_argument("--mhc-h-res-proj", type=str, default="sinkhorn", choices=["sinkhorn", "orthostochastic"],
+    help="projection method for doubly-stochastic H_res matrix (sinkhorn or orthostochastic)")
+
+# MHC Projection - Sinkhorn Parameters
+parser.add_argument("--mhc-sinkhorn-iters", type=int, default=10, help="Sinkhorn-Knopp iterations (default: 10)")
+parser.add_argument("--mhc-sinkhorn-tau", type=float, default=0.05, help="Sinkhorn temperature parameter (default: 0.05)")
+
+# MHC Projection - Orthostochastic Parameters
+parser.add_argument("--mhc-ortho-steps", type=int, default=5, help="Newton-Schulz steps for orthostochastic projection (default: 5)")
+parser.add_argument("--mhc-ortho-eps", type=float, default=1e-7, help="Epsilon for orthostochastic projection (default: 1e-7)")
+
+# Geometric HC - Specific Parameters
+parser.add_argument("--hc-manifold-dim", type=int, default=4, help="manifold dimension for geometric hyper-connections")
 args = parser.parse_args()
+
+# -----------------------------------------------------------------------------
+# Resolve MHC mode and projection parameters
+# -----------------------------------------------------------------------------
+
+def resolve_mhc_mode(args):
+    """Convert --mhc-mode to internal flags"""
+    mode_mapping = {
+        "standard": (False, False, False),
+        "mhc-static": (True, False, False),
+        "mhc-dynamic": (True, False, True),
+        "mhc-geometric": (True, True, False),
+    }
+    args.mhc, args.hc_geometric, args.dynamic_H = mode_mapping[args.mhc_mode]
+    return args
+
+def resolve_projection_params(args):
+    """Set up projection parameters for the model"""
+    # Use sinkhorn parameters directly
+    args.sinkhorn_iters = args.mhc_sinkhorn_iters
+    args.sinkhorn_tau = args.mhc_sinkhorn_tau
+
+    # Use orthostochastic parameters directly
+    args.ns_steps = args.mhc_ortho_steps
+    args.ns_eps = args.mhc_ortho_eps
+    args.ns_coeffs = (3.0, -3.2, 1.2)  # Default coefficients
+
+    return args
+
+def validate_hc_args(args):
+    """Validate Hyper-Connections arguments"""
+    # Check if HC is effectively disabled
+    if args.hc_disable or args.hc_num_streams == 1:
+        if args.hc_disable and args.hc_num_streams > 1:
+            print0("⚠️  Warning: --hc-disable set but hc-num-streams > 1. HC will be disabled.")
+        return
+
+    # Validate num_streams
+    if args.hc_num_streams < 1:
+        raise ValueError(f"hc_num_streams must be >= 1, got {args.hc_num_streams}")
+
+    # Validate projection method for MHC modes
+    if args.mhc_mode in ["mhc-static", "mhc-dynamic", "mhc-geometric"]:
+        if args.mhc_h_res_proj not in ["sinkhorn", "orthostochastic"]:
+            raise ValueError(f"Invalid mhc_h_res_proj: {args.mhc_h_res_proj}")
+
+        # Validate projection parameters
+        if args.sinkhorn_iters <= 0:
+            raise ValueError(f"sinkhorn_iters must be > 0, got {args.sinkhorn_iters}")
+        if args.sinkhorn_tau <= 0:
+            raise ValueError(f"sinkhorn_tau must be > 0, got {args.sinkhorn_tau}")
+
+    # Geometric-specific validation
+    if args.mhc_mode == "mhc-geometric":
+        if args.hc_manifold_dim < 1:
+            raise ValueError(f"hc_manifold_dim must be >= 1, got {args.hc_manifold_dim}")
+        if args.hc_h_mode not in ["per-token", "per-seq"]:
+            raise ValueError(f"Invalid hc_h_mode: {args.hc_h_mode}")
+        if args.hc_h_mode == "per-seq" and args.hc_pool_type not in ["mean", "max", "last"]:
+            raise ValueError(f"Invalid hc_pool_type: {args.hc_pool_type}")
+    else:
+        # Warn if geometric-specific params are set but not used
+        if args.hc_manifold_dim != 4:
+            print0(f"⚠️  Warning: --hc-manifold-dim={args.hc_manifold_dim} is ignored in {args.mhc_mode} mode")
+
+def print_hc_config(args):
+    """Print Hyper-Connections configuration at training start"""
+    print0("\n" + "=" * 70)
+    print0("Hyper-Connections Configuration")
+    print0("=" * 70)
+
+    # Check if disabled
+    if args.hc_disable or args.hc_num_streams == 1:
+        print0("Status: ❌ DISABLED")
+        if args.hc_disable:
+            print0("  Reason: --hc-disable flag set")
+        else:
+            print0("  Reason: hc-num-streams=1")
+        print0("=" * 70 + "\n")
+        return
+
+    # Print basic config
+    print0("Status: ✅ ENABLED")
+    print0(f"Mode: {args.mhc_mode}")
+    print0(f"Streams: {args.hc_num_streams}")
+    print0(f"Gradient Checkpointing: {args.gradient_checkpointing}")
+    print0()
+
+    # Mode-specific details
+    if args.mhc_mode == "standard":
+        print0("📊 Standard Mode:")
+        print0("  • Learnable alpha/beta parameters")
+        print0("  • No manifold constraints")
+
+    elif args.mhc_mode == "mhc-static":
+        print0("📊 MHC Static Mode:")
+        print0("  • Static doubly-stochastic H_res")
+        print0(f"  • H_res projection: {args.mhc_h_res_proj}")
+        if args.mhc_h_res_proj == "sinkhorn":
+            print0(f"    - Sinkhorn iterations: {args.sinkhorn_iters}")
+            print0(f"    - Sinkhorn tau: {args.sinkhorn_tau}")
+        else:
+            print0(f"    - Newton-Schulz steps: {args.ns_steps}")
+            print0(f"    - NS epsilon: {args.ns_eps}")
+
+    elif args.mhc_mode == "mhc-dynamic":
+        print0("📊 MHC Dynamic Mode:")
+        print0("  • Per-token dynamic H generation")
+        print0("  • Input-dependent H matrices")
+        print0(f"  • H_res projection: {args.mhc_h_res_proj}")
+        if args.mhc_h_res_proj == "sinkhorn":
+            print0(f"    - Sinkhorn iterations: {args.sinkhorn_iters}")
+            print0(f"    - Sinkhorn tau: {args.sinkhorn_tau}")
+        else:
+            print0(f"    - Newton-Schulz steps: {args.ns_steps}")
+            print0(f"    - NS epsilon: {args.ns_eps}")
+
+    elif args.mhc_mode == "mhc-geometric":
+        print0("📊 MHC Geometric Mode:")
+        print0("  • Geometry-induced H_res from manifold distances")
+        print0(f"  • Manifold dimension: {args.hc_manifold_dim}")
+        print0(f"  • H granularity: {args.hc_h_mode}")
+        if args.hc_h_mode == "per-seq":
+            print0(f"    - Pooling type: {args.hc_pool_type}")
+        print0(f"  • H_res projection: {args.mhc_h_res_proj}")
+        if args.mhc_h_res_proj == "sinkhorn":
+            print0(f"    - Sinkhorn iterations: {args.sinkhorn_iters}")
+            print0(f"    - Sinkhorn tau: {args.sinkhorn_tau}")
+        else:
+            print0(f"    - Newton-Schulz steps: {args.ns_steps}")
+            print0(f"    - NS epsilon: {args.ns_eps}")
+
+    print0("=" * 70 + "\n")
+
+# Apply resolution and validation
+args = resolve_mhc_mode(args)
+args = resolve_projection_params(args)
+validate_hc_args(args)
+
 user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------
 
@@ -119,6 +270,9 @@ tokenizer = get_tokenizer()
 token_bytes = get_token_bytes(device=device)
 vocab_size = tokenizer.get_vocab_size()
 print0(f"Vocab size: {vocab_size:,}")
+
+# Print Hyper-Connections configuration
+print_hc_config(args)
 
 # Model kwargs are derived from the desired depth of the model
 num_layers = args.depth
@@ -187,6 +341,9 @@ model_config_kwargs = dict(
     hc_manifold_dim=args.hc_manifold_dim,
     sinkhorn_iters=args.sinkhorn_iters,
     sinkhorn_tau=args.sinkhorn_tau,
+    ns_steps=args.ns_steps,
+    ns_eps=args.ns_eps,
+    ns_coeffs=args.ns_coeffs,
     mhc_h_res_proj=args.mhc_h_res_proj,
     gradient_checkpointing=args.gradient_checkpointing,
     hc_h_mode=args.hc_h_mode,
