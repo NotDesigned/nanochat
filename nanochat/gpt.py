@@ -27,6 +27,35 @@ from torch.utils.checkpoint import checkpoint
 
 
 @dataclass
+class HCConfig:
+    """HyperConnections configuration"""
+    # Mode flags (set internally, not by user)
+    mhc: bool = False
+    hc_geometric: bool = False
+    dynamic_H: bool = False
+
+    # Projection method
+    mhc_h_res_proj: str = "sinkhorn"
+
+    # Sinkhorn parameters
+    sinkhorn_iters: int = 10
+    sinkhorn_tau: float = 0.05
+
+    # Orthostochastic parameters
+    ns_steps: int = 5
+    ns_eps: float = 1e-7
+    ns_coeffs: tuple = (3.0, -3.2, 1.2)
+
+    # Geometric-specific parameters
+    manifold_dim: int = 4
+    sigma_init: float = 1.0
+    sigma_learnable: bool = True
+    H_mode: str = "per-token"
+    pool_type: str = "last"
+
+
+
+@dataclass
 class GPTConfig:
     sequence_len: int = 1024
     vocab_size: int = 50304
@@ -38,25 +67,14 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (half context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "L"
-    
-    # hyper-connections
+
+    # HyperConnections
     hc_num_streams: int = 1
-    # hc_num_fracs: int = 1
     hc_disable: bool = False
-    mhc: bool = False
-    hc_geometric: bool = False  # use geometric-induced hyper-connections
-    dynamic_H: bool = False  # enable dynamic H generation for regular hyper-connections
-    hc_manifold_dim: int = 4  # manifold dimension for geometric HC
-    hc_h_mode: str = "per-token"
-    # hc_chunk_size: int = 8
-    hc_pool_type: str = "mean"
-    sinkhorn_iters: int = 10
-    sinkhorn_tau: float = 0.05
-    mhc_h_res_proj: str = "sinkhorn"
-    ns_steps: int = 5
-    ns_eps: float = 1e-7
-    ns_coeffs: tuple = (3.0, -3.2, 1.2)
+    
     gradient_checkpointing: bool = False
+    
+    hc: HCConfig = HCConfig()
 
 
 def norm(x):
@@ -191,43 +209,19 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-        if config.hc_geometric:
-            # Geometric is a variant of MHC, must set mhc=True
-            hc_kwargs = dict(
-                mhc=True,  # Required for geometric mode
-                hc_geometric=True,
-                manifold_dim=config.hc_manifold_dim,
-                # Projection parameters (now shared by both geometric and dynamic)
-                mhc_h_res_proj=config.mhc_h_res_proj,
-                sinkhorn_iters=config.sinkhorn_iters,
-                sinkhorn_tau=config.sinkhorn_tau,
-                ns_steps=config.ns_steps,
-                ns_eps=config.ns_eps,
-                ns_coeffs=config.ns_coeffs,
-            )
-        else:
-            hc_kwargs = dict(
-                mhc=config.mhc,
-                sinkhorn_iters=config.sinkhorn_iters,
-                sinkhorn_tau=config.sinkhorn_tau,
-                mhc_h_res_proj=config.mhc_h_res_proj,
-                ns_steps=config.ns_steps,
-                ns_eps=config.ns_eps,
-                ns_coeffs=config.ns_coeffs,
-            )
-
+        # Pass HC config directly
         self.hc_attn = init_hc(
             dim=config.n_embd,
             branch=AttnBranch(self.attn),
             layer_index=layer_idx * 2,
-            **hc_kwargs,
+            hc_config=config.hc,
         )
 
         self.hc_mlp = init_hc(
             dim=config.n_embd,
             branch=MlpBranch(self.mlp),
             layer_index=layer_idx * 2 + 1,
-            **hc_kwargs,
+            hc_config=config.hc,
         )
 
     def forward(self, x, cos_sin, window_size, kv_cache):
@@ -260,19 +254,8 @@ class GPT(nn.Module):
         init_hc, expand_stream, reduce_stream = (
             get_init_and_expand_reduce_stream_functions(
                 config.hc_num_streams,
-                # num_fracs=config.hc_num_fracs,
                 disable=config.hc_disable,
-                gradient_checkpointing=config.gradient_checkpointing,
-                dynamic_H=config.dynamic_H,
-                hc_geometric=config.hc_geometric,
-                manifold_dim=config.hc_manifold_dim,
-                H_mode=config.hc_h_mode,
-                # chunk_size=config.hc_chunk_size,
-                pool_type=config.hc_pool_type,
-                mhc=config.mhc,
-                sinkhorn_iters=config.sinkhorn_iters,
-                sinkhorn_tau=config.sinkhorn_tau,
-                mhc_h_res_proj=config.mhc_h_res_proj,
+                hc_config=config.hc,
             )
         )
         self.expand_stream = expand_stream

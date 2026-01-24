@@ -53,29 +53,29 @@ python -m nanochat.report reset
 # each data shard is ~250M chars
 # so we download 2e9 / 250e6 = 8 data shards at this point
 # each shard is ~100MB of text (compressed), so this is about ~800MB of data on disk
-python -m nanochat.dataset -n 8
-# Immediately also kick off downloading more shards in the background while tokenizer trains
-# See comment below for why 370 is the right number here
-python -m nanochat.dataset -n 370 &
-DATASET_DOWNLOAD_PID=$!
-# train the tokenizer with vocab size 2**16 = 65536 on ~2B characters of data
-python -m scripts.tok_train --max-chars=2000000000 --vocab-size=65536
-# evaluate the tokenizer (report compression ratio etc.)
-python -m scripts.tok_eval
+# python -m nanochat.dataset -n 8
+# # Immediately also kick off downloading more shards in the background while tokenizer trains
+# # See comment below for why 370 is the right number here
+# python -m nanochat.dataset -n 370 &
+# DATASET_DOWNLOAD_PID=$!
+# # train the tokenizer with vocab size 2**16 = 65536 on ~2B characters of data
+# python -m scripts.tok_train --max-chars=2000000000 --vocab-size=65536
+# # evaluate the tokenizer (report compression ratio etc.)
+# python -m scripts.tok_eval
 
-# -----------------------------------------------------------------------------
-# Base model (pretraining)
+# # -----------------------------------------------------------------------------
+# # Base model (pretraining)
 
-# The d20 model is 561M parameters.
-# Chinchilla says #tokens = 20X #params, so we need 561e6 * 20 = 11.2B tokens.
-# Assume our tokenizer is 4.8 chars/token, this is 11.2B * 4.8 ~= 54B chars.
-# At 250M chars/shard, this is 54B / 250M ~= 216 shards needed for pretraining.
-# Round up to 240 for safety. Also, the new DataLoader wastes about 35% of tokens to cropping
-# so 240 / (1 - 0.35) = 370 shards are needed.
-# At ~100MB/shard, this downloads ~37GB of data to disk.
-# (The total number of shards available in the entire dataset is 1822.)
-echo "Waiting for dataset download to complete..."
-wait $DATASET_DOWNLOAD_PID
+# # The d20 model is 561M parameters.
+# # Chinchilla says #tokens = 20X #params, so we need 561e6 * 20 = 11.2B tokens.
+# # Assume our tokenizer is 4.8 chars/token, this is 11.2B * 4.8 ~= 54B chars.
+# # At 250M chars/shard, this is 54B / 250M ~= 216 shards needed for pretraining.
+# # Round up to 240 for safety. Also, the new DataLoader wastes about 35% of tokens to cropping
+# # so 240 / (1 - 0.35) = 370 shards are needed.
+# # At ~100MB/shard, this downloads ~37GB of data to disk.
+# # (The total number of shards available in the entire dataset is 1822.)
+# echo "Waiting for dataset download to complete..."
+# wait $DATASET_DOWNLOAD_PID
 
 # Number of processes/GPUs to use
 NPROC_PER_NODE=${NPROC_PER_NODE:-1}
@@ -83,16 +83,24 @@ NPROC_PER_NODE=${NPROC_PER_NODE:-1}
 # pretrain the d20 model
 # torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- --depth=20 --target-param-data-ratio=20 --run=$WANDB_RUN \
     # --mhc --hc-num-streams=8 --device-batch-size=8
+
 torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- --depth=20 --target-param-data-ratio=20 \
     --device-batch-size=1 --eval-tokens=65536 --max-seq-len=1024 --total-batch-size=131072 --num-iterations=-1 \
-    --mhc-mode=mhc-static --hc-num-streams=8 \
+    --mhc-mode=standard --hc-num-streams=1 \
+    --mhc-h-res-proj="orthostochastic" \
     --mhc-sinkhorn-iters=10 \
     --eval-every=100 \
     --core-metric-every 500 \
     --core-metric-max-per-task 50 \
     --gqa-ratio=1 --save-every=100 \
     --log-every=10 \
-    --run=$WANDB_RUN
+    --run=$WANDB_RUN \
+    # --wandb-resume-id="pk2iov4i" \
+    # --resume-from-step=900 \
+    # --sample-every=100 \
+
+    # To use geometric mode instead:
+    # --mhc-mode=mhc-geometric --hc-manifold-dim=8 --hc-h-mode=per-seq --hc-pool-type=last \
 # evaluate the model on a larger chunk of train/val data and draw some samples
 torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_loss -- --device-batch-size=4
 # evaluate the model on CORE tasks

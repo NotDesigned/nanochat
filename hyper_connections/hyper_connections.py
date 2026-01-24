@@ -171,51 +171,28 @@ def get_init_and_expand_reduce_stream_functions(
     dim=None,
     add_stream_embed=False,
     disable=None,
-    gradient_checkpointing=False,
-    dynamic_H=False,
-    # Geometric mode parameters
-    hc_geometric=False,
-    manifold_dim=4,
-    sigma_init=1.0,
-    sigma_learnable=True,
-    H_mode="per-token",
-    pool_type="last",
-    # MHC parameters
-    mhc=False,
-    sinkhorn_iters=10,
-    sinkhorn_tau=0.05,
-    mhc_h_res_proj="sinkhorn",
-    **kwargs  # Catch any other parameters
+    hc_config=None,  # HCConfig object
 ):
     """
-    Unified factory function for creating HyperConnections initialization function.
+    Factory function for creating HyperConnections initialization function.
 
-    Supports three modes:
-    - Standard: Original learnable alpha/beta (when mhc=False, hc_geometric=False)
-    - MHC: manifold-constraint Hyper-Connections with static/dynamic/Geometry H (when mhc=True)
+    Args:
+        num_streams: Number of residual streams
+        dim: Feature dimension
+        add_stream_embed: Whether to add stream embeddings
+        disable: Force disable HC
+        hc_config: HCConfig object (optional, will use defaults if None)
     """
     if num_streams == 1:
         print0("Warning: num_streams=1, HyperConnections will be disabled.")
         disable = True
-    
+
     hyper_conn_klass = HyperConnections if not disable else Residual
 
     init_hyper_conn_fn = partial(
         hyper_conn_klass,
         num_streams,
-        gradient_checkpointing=gradient_checkpointing,
-        dynamic_H=dynamic_H,
-        hc_geometric=hc_geometric,
-        manifold_dim=manifold_dim,
-        sigma_init=sigma_init,
-        sigma_learnable=sigma_learnable,
-        H_mode=H_mode,
-        pool_type=pool_type,
-        mhc=mhc,
-        sinkhorn_iters=sinkhorn_iters,
-        sinkhorn_tau=sinkhorn_tau,
-        mhc_h_res_proj=mhc_h_res_proj,
-        **kwargs
+        hc_config=hc_config,
     )
     expand_reduce_fns = get_expand_reduce_stream_functions(
         num_streams, add_stream_embed=add_stream_embed, dim=dim, disable=disable
@@ -372,38 +349,44 @@ class HyperConnections(Module):
         dim,
         branch: Module | None = None,
         layer_index=None,
+        hc_config=None,  # HCConfig object
+        # Basic parameters
         tanh=True,
         channel_first=False,
         dropout=0.0,
-        residual_transform: Module
-        | None = None,  # to support resnet blocks where dimension in not equal to dimension out - usually a residual conv
-        add_branch_out_to_residual=True,  # will disable depth connections (weighted residual sum with beta) if set False
-        num_input_views=1,  # allow for the branch module to receive multiple input views, dimension placed on the very left (before batch)
+        residual_transform: Module | None = None,
+        add_branch_out_to_residual=True,
+        num_input_views=1,
         depth_residual_fn=add,
-        mhc=False,
-        dynamic_H=False,  # enable dynamic H generation for mhc mode
-        sinkhorn_iters=10,
-        sinkhorn_tau=0.05,
-        mhc_h_res_proj="sinkhorn",
-        ns_steps=5,
-        ns_eps=1e-7,
-        ns_coeffs=(3.0, -3.2, 1.2),
-        gradient_checkpointing=False,
-        # Geometric mode parameters
-        hc_geometric=False,  # enable geometric-induced HC
-        manifold_dim=4,  # manifold dimension for geometric projection
-        sigma_init=1.0,  # initial RBF bandwidth
-        sigma_learnable=True,  # whether sigma is learnable
-        H_mode="per-token",  # geometric H granularity: per-token/per-seq
-        pool_type="last",  # pooling type: mean/max/last
     ):
         """
         Appendix J, Algorithm2 in - https://arxiv.org/abs/2409.19606
         """
         super().__init__()
 
-        self.branch = branch
+        # Import HCConfig if needed (to get defaults)
+        if hc_config is None:
+            from nanochat.gpt import HCConfig
+            hc_config = HCConfig()
 
+        # Extract all HC parameters from config
+        mhc = hc_config.mhc
+        hc_geometric = hc_config.hc_geometric
+        dynamic_H = hc_config.dynamic_H
+        mhc_h_res_proj = hc_config.mhc_h_res_proj
+        sinkhorn_iters = hc_config.sinkhorn_iters
+        sinkhorn_tau = hc_config.sinkhorn_tau
+        ns_steps = hc_config.ns_steps
+        ns_eps = hc_config.ns_eps
+        ns_coeffs = hc_config.ns_coeffs
+        manifold_dim = hc_config.manifold_dim
+        sigma_init = hc_config.sigma_init
+        sigma_learnable = hc_config.sigma_learnable
+        H_mode = hc_config.H_mode
+        pool_type = hc_config.pool_type
+        gradient_checkpointing = hc_config.gradient_checkpointing
+
+        self.branch = branch
         self.act = nn.Tanh() if tanh else nn.Identity()
 
         # RMSNorm for standard mode
