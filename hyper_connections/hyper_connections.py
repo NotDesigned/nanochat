@@ -63,8 +63,8 @@ def sinkhorn_log(logits, num_iters=10, tau=0.05):
     """
     n = logits.shape[-1]
     Z = logits / tau
-    log_marginal = torch.full(
-        (n,), -math.log(n), device=logits.device, dtype=logits.dtype
+    log_marginal = torch.zeros(
+        (n,), device=logits.device, dtype=logits.dtype
     )
 
     # Initialize u, v with proper batch shape
@@ -76,7 +76,7 @@ def sinkhorn_log(logits, num_iters=10, tau=0.05):
         u = log_marginal - torch.logsumexp(Z + v.unsqueeze(-2), dim=-1)
         v = log_marginal - torch.logsumexp(Z + u.unsqueeze(-1), dim=-2)
 
-    return torch.exp(Z + u.unsqueeze(-1) + v.unsqueeze(-2)) * n
+    return torch.exp(Z + u.unsqueeze(-1) + v.unsqueeze(-2))
 
 
 def zeropower_via_newtonschulz(X, steps=5, eps=1e-7, coeffs=(3.0, -3.2, 1.2)):
