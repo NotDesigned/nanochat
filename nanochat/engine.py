@@ -223,72 +223,116 @@ class Engine:
         logits = self.model.forward(ids, kv_cache=kv_cache_prefill)
         logits = logits[:, -1, :].expand(num_samples, -1)  # (num_samples, vocab_size)
 
-        # 2) Replicate the KV cache for each sample/row
-        kv_length_hint = (len(tokens) + max_tokens) if max_tokens is not None else self.model.config.sequence_len
-        kv_cache_decode = KVCache(
-            batch_size=num_samples,
-            seq_len=kv_length_hint,
-            **kv_model_kwargs,
-        )
-        kv_cache_decode.prefill(kv_cache_prefill)
-        del kv_cache_prefill # no need to keep this memory around
+        if kv_cache_prefill.kv_cache is None:
+            # Fallback: model does not support KV cache, recompute everything each step
+            ids = torch.tensor([tokens], dtype=torch.long, device=device)
+            row_states = [RowState(tokens.copy()) for _ in range(num_samples)]
+            num_generated = 0
+            while True:
+                if max_tokens is not None and num_generated >= max_tokens:
+                    break
+                if all(state.completed for state in row_states):
+                    break
+                logits = self.model.forward(ids)
+                logits = logits[:, -1, :].expand(num_samples, -1)
+                next_ids = sample_next_token(logits, rng, temperature, top_k)
+                sampled_tokens = next_ids[:, 0].tolist()
+                token_column = []
+                token_masks = []
+                for i, state in enumerate(row_states):
+                    is_forced = len(state.forced_tokens) > 0
+                    token_masks.append(0 if is_forced else 1)
+                    next_token = state.forced_tokens.popleft() if is_forced else sampled_tokens[i]
+                    token_column.append(next_token)
+                    state.current_tokens.append(next_token)
+                    if next_token == assistant_end or next_token == bos:
+                        state.completed = True
+                    if next_token == python_start:
+                        state.in_python_block = True
+                        state.python_expr_tokens = []
+                    elif next_token == python_end and state.in_python_block:
+                        state.in_python_block = False
+                        if state.python_expr_tokens:
+                            expr = self.tokenizer.decode(state.python_expr_tokens)
+                            result = use_calculator(expr)
+                            if result is not None:
+                                result_tokens = self.tokenizer.encode(str(result))
+                                state.forced_tokens.append(output_start)
+                                state.forced_tokens.extend(result_tokens)
+                                state.forced_tokens.append(output_end)
+                        state.python_expr_tokens = []
+                    elif state.in_python_block:
+                        state.python_expr_tokens.append(next_token)
+                yield token_column, token_masks
+                num_generated += 1
+                ids = torch.cat([ids, next_ids], dim=1)
+        else:
+            # 2) Replicate the KV cache for each sample/row
+            kv_length_hint = (len(tokens) + max_tokens) if max_tokens is not None else self.model.config.sequence_len
+            kv_cache_decode = KVCache(
+                batch_size=num_samples,
+                seq_len=kv_length_hint,
+                **kv_model_kwargs,
+            )
+            kv_cache_decode.prefill(kv_cache_prefill)
+            del kv_cache_prefill # no need to keep this memory around
 
-        # 3) Initialize states for each sample
-        row_states = [RowState(tokens.copy()) for _ in range(num_samples)]
+            # 3) Initialize states for each sample
+            row_states = [RowState(tokens.copy()) for _ in range(num_samples)]
 
-        # 4) Main generation loop
-        num_generated = 0
-        while True:
-            # Stop condition: we've reached max tokens
-            if max_tokens is not None and num_generated >= max_tokens:
-                break
-            # Stop condition: all rows are completed
-            if all(state.completed for state in row_states):
-                break
+            # 4) Main generation loop
+            num_generated = 0
+            while True:
+                # Stop condition: we've reached max tokens
+                if max_tokens is not None and num_generated >= max_tokens:
+                    break
+                # Stop condition: all rows are completed
+                if all(state.completed for state in row_states):
+                    break
 
-            # Sample the next token for each row
-            next_ids = sample_next_token(logits, rng, temperature, top_k)  # (B, 1)
-            sampled_tokens = next_ids[:, 0].tolist()
+                # Sample the next token for each row
+                next_ids = sample_next_token(logits, rng, temperature, top_k)  # (B, 1)
+                sampled_tokens = next_ids[:, 0].tolist()
 
-            # Process each row: choose the next token, update state, optional tool use
-            token_column = [] # contains the next token id along each row
-            token_masks = [] # contains the mask (was it sampled (1) or forced (0)?) along each row
-            for i, state in enumerate(row_states):
-                # Select the next token in this row
-                is_forced = len(state.forced_tokens) > 0 # are there tokens waiting to be forced in deque?
-                token_masks.append(0 if is_forced else 1) # mask is 0 if forced, 1 if sampled
-                next_token = state.forced_tokens.popleft() if is_forced else sampled_tokens[i]
-                token_column.append(next_token)
-                # Update the state of this row to include the next token
-                state.current_tokens.append(next_token)
-                # On <|assistant_end|> or <|bos|>, mark the row as completed
-                if next_token == assistant_end or next_token == bos:
-                    state.completed = True
-                # Handle tool logic
-                if next_token == python_start:
-                    state.in_python_block = True
-                    state.python_expr_tokens = []
-                elif next_token == python_end and state.in_python_block:
-                    state.in_python_block = False
-                    if state.python_expr_tokens:
-                        expr = self.tokenizer.decode(state.python_expr_tokens)
-                        result = use_calculator(expr)
-                        if result is not None:
-                            result_tokens = self.tokenizer.encode(str(result))
-                            state.forced_tokens.append(output_start)
-                            state.forced_tokens.extend(result_tokens)
-                            state.forced_tokens.append(output_end)
-                    state.python_expr_tokens = []
-                elif state.in_python_block:
-                    state.python_expr_tokens.append(next_token)
+                # Process each row: choose the next token, update state, optional tool use
+                token_column = [] # contains the next token id along each row
+                token_masks = [] # contains the mask (was it sampled (1) or forced (0)?) along each row
+                for i, state in enumerate(row_states):
+                    # Select the next token in this row
+                    is_forced = len(state.forced_tokens) > 0 # are there tokens waiting to be forced in deque?
+                    token_masks.append(0 if is_forced else 1) # mask is 0 if forced, 1 if sampled
+                    next_token = state.forced_tokens.popleft() if is_forced else sampled_tokens[i]
+                    token_column.append(next_token)
+                    # Update the state of this row to include the next token
+                    state.current_tokens.append(next_token)
+                    # On <|assistant_end|> or <|bos|>, mark the row as completed
+                    if next_token == assistant_end or next_token == bos:
+                        state.completed = True
+                    # Handle tool logic
+                    if next_token == python_start:
+                        state.in_python_block = True
+                        state.python_expr_tokens = []
+                    elif next_token == python_end and state.in_python_block:
+                        state.in_python_block = False
+                        if state.python_expr_tokens:
+                            expr = self.tokenizer.decode(state.python_expr_tokens)
+                            result = use_calculator(expr)
+                            if result is not None:
+                                result_tokens = self.tokenizer.encode(str(result))
+                                state.forced_tokens.append(output_start)
+                                state.forced_tokens.extend(result_tokens)
+                                state.forced_tokens.append(output_end)
+                        state.python_expr_tokens = []
+                    elif state.in_python_block:
+                        state.python_expr_tokens.append(next_token)
 
-            # Yield the token column
-            yield token_column, token_masks
-            num_generated += 1
+                # Yield the token column
+                yield token_column, token_masks
+                num_generated += 1
 
-            # Prepare logits for next iteration
-            ids = torch.tensor(token_column, dtype=torch.long, device=device).unsqueeze(1)
-            logits = self.model.forward(ids, kv_cache=kv_cache_decode)[:, -1, :]  # (B, vocab_size)
+                # Prepare logits for next iteration
+                ids = torch.tensor(token_column, dtype=torch.long, device=device).unsqueeze(1)
+                logits = self.model.forward(ids, kv_cache=kv_cache_decode)[:, -1, :]  # (B, vocab_size)
 
     def generate_batch(self, tokens, num_samples=1, **kwargs):
         """

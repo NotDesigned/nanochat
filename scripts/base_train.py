@@ -21,6 +21,7 @@ import wandb
 import torch
 
 from nanochat.gpt import GPT, GPTConfig, HCConfig
+from nanochat.complex_gpt import GPT as SchrodingerGPT, GPTConfig as SchrodingerGPTConfig
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
@@ -85,7 +86,7 @@ parser.add_argument("--model-tag", type=str, default=None, help="override model 
 # HyperConnections - Basic
 parser.add_argument("--hc-num-streams", type=int, default=1, help="number of hyper-connection streams")
 parser.add_argument("--hc-disable", action="store_true", help="disable hyper-connections (use identity)")
-parser.add_argument("--gradient-checkpointing", action="store_true", help="enable gradient checkpointing for HyperConnections")
+parser.add_argument("--gradient-checkpointing", action="store_true", help="enable gradient checkpointing")
 
 # HyperConnections - Mode Selection
 parser.add_argument("--mhc-mode", type=str, default="standard",
@@ -112,6 +113,9 @@ parser.add_argument("--mhc-ortho-eps", type=float, default=_HC_DEFAULTS.ns_eps,
 # Geometric HC - Specific Parameters
 parser.add_argument("--hc-manifold-dim", type=int, default=_HC_DEFAULTS.manifold_dim,
     help="Manifold dimension for geometric hyper-connections")
+# Schrödinger GPT
+parser.add_argument("--use-schrodinger", action="store_true",
+    help="Use Schrödinger GPT (quantum-inspired attention) instead of standard GPT")
 args = parser.parse_args()
 
 # Convert --mhc-mode to internal flags
@@ -229,10 +233,20 @@ model_config_kwargs = dict(
     hc=hc_config,
     gradient_checkpointing=args.gradient_checkpointing,
 )
+
+# Select GPT implementation
+if args.use_schrodinger:
+    print0("Using Schrödinger GPT (quantum-inspired attention)")
+    GPTClass = SchrodingerGPT
+    GPTConfigClass = SchrodingerGPTConfig
+else:
+    GPTClass = GPT
+    GPTConfigClass = GPTConfig
+
 with torch.device("meta"):
     # All tensors are created as meta tensors (they have shape/dtype but no data)
-    model_config = GPTConfig(**model_config_kwargs)
-    model = GPT(model_config)
+    model_config = GPTConfigClass(**model_config_kwargs)
+    model = GPTClass(model_config)
 model.to_empty(device=device) # All tensors get storage on target device but with uninitialized (garbage) data
 model.init_weights() # All tensors get initialized
 
@@ -415,7 +429,7 @@ while True:
             { # metadata saved as json
                 "step": step,
                 "val_bpb": val_bpb, # loss at last step
-                "model_config": model_config_kwargs,
+                "model_config": {**model_config_kwargs, "hc": vars(model_config_kwargs["hc"])},  # convert HCConfig to dict for JSON
                 "user_config": user_config, # inputs to the training script
                 "device_batch_size": args.device_batch_size,
                 "max_seq_len": args.max_seq_len,
